@@ -25,6 +25,8 @@ function visibilityToOpacity(visM, state) {
 
 export function createWeatherController({ map, state, elements, dbg }) {
   let lastWeatherKey = null;
+  let pendingWeatherKey = null;
+  let pendingWeatherPromise = null;
   let requestController = null;
   let debounceTimer = null;
   let refreshInterval = null;
@@ -32,16 +34,25 @@ export function createWeatherController({ map, state, elements, dbg }) {
 
   async function fetchWeather(lon, lat) {
     const key = `${lat.toFixed(2)},${lon.toFixed(2)}`;
-    if (key === lastWeatherKey && state.hazeMode === 'live') return;
+    if (key === lastWeatherKey && state.hazeMode === 'live') {
+      if (key === pendingWeatherKey && pendingWeatherPromise) return pendingWeatherPromise;
+      return;
+    }
     lastWeatherKey = key;
     if (requestController) requestController.abort();
     requestController = new AbortController();
+    pendingWeatherKey = key;
+    pendingWeatherPromise = loadWeather(lon, lat, requestController.signal);
+    return pendingWeatherPromise;
+  }
+
+  async function loadWeather(lon, lat, signal) {
     const url = `https://api.open-meteo.com/v1/forecast` +
       `?latitude=${lat}&longitude=${lon}` +
       `&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code,visibility` +
       `&temperature_unit=celsius&wind_speed_unit=kmh&timezone=auto`;
     try {
-      const response = await fetch(url, { signal: requestController.signal });
+      const response = await fetch(url, { signal });
       if (!response.ok) throw new Error('HTTP ' + response.status);
       const data = await response.json();
       const current = data.current || {};

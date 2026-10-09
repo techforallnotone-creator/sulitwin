@@ -3,7 +3,6 @@ import terrainSurveyData from '../data/terrain_salim_dem.js';
 export function createTerrainController({ map, state, dbg, logPrompt }) {
     const DEM_SOURCE_ID = 'terrain-survey-src';
     const DEM_LAYER_ID = 'terrain-fill';
-    const DEM_EXTRUSION_SOURCE_ID = 'terrain-survey-extrusion-src';
     const DEM_EXTRUSION_LAYER_ID = 'terrain-extrusion';
     const CONTOUR_SOURCE_ID = 'terrain-contour-src';
     const CONTOUR_LAYER_ID = 'terrain-contours';
@@ -11,6 +10,17 @@ export function createTerrainController({ map, state, dbg, logPrompt }) {
     const { width, height, minLat, maxLat, minLon, maxLon, cellLat, cellLon, elevation, minElevation, maxElevation } = terrainSurveyData;
     const DEM = elevation;
     const contourStep = 5;
+    const colorCache = new Map();
+    const colorStops = [
+        [minElevation, '#d8e7cf'],
+        [minElevation + (maxElevation - minElevation) * 0.25, '#b7dca1'],
+        [minElevation + (maxElevation - minElevation) * 0.5, '#8ec07a'],
+        [minElevation + (maxElevation - minElevation) * 0.65, '#c9a466'],
+        [minElevation + (maxElevation - minElevation) * 0.8, '#8a6a4d'],
+        [maxElevation, '#53463a']
+    ].map(([value, color]) => [value, hexToRgb(color)]);
+    let terrainLayersReady = false;
+    let terrainDataLoaded = false;
 
     function valueAt(x, y) {
         if (x < 0 || y < 0 || x >= width || y >= height) return null;
@@ -112,26 +122,20 @@ export function createTerrainController({ map, state, dbg, logPrompt }) {
     }
 
     function interpolatedColor(elevationValue) {
-        const stops = [
-            [minElevation, '#d8e7cf'],
-            [minElevation + (maxElevation - minElevation) * 0.25, '#b7dca1'],
-            [minElevation + (maxElevation - minElevation) * 0.5, '#8ec07a'],
-            [minElevation + (maxElevation - minElevation) * 0.65, '#c9a466'],
-            [minElevation + (maxElevation - minElevation) * 0.8, '#8a6a4d'],
-            [maxElevation, '#53463a']
-        ];
-        for (let i = 0; i < stops.length - 1; i++) {
-            const [lowVal, lowColor] = stops[i];
-            const [highVal, highColor] = stops[i + 1];
+        const cachedColor = colorCache.get(elevationValue);
+        if (cachedColor) return cachedColor;
+        for (let i = 0; i < colorStops.length - 1; i++) {
+            const [lowVal, lowColor] = colorStops[i];
+            const [highVal, highColor] = colorStops[i + 1];
             if (elevationValue >= lowVal && elevationValue <= highVal) {
                 const t = (elevationValue - lowVal) / (highVal - lowVal || 1);
-                const [lR, lG, lB] = hexToRgb(lowColor);
-                const [hR, hG, hB] = hexToRgb(highColor);
-                return rgbToHex(
-                    Math.round(lR + (hR - lR) * t),
-                    Math.round(lG + (hG - lG) * t),
-                    Math.round(lB + (hB - lB) * t)
+                const color = rgbToHex(
+                    Math.round(lowColor[0] + (highColor[0] - lowColor[0]) * t),
+                    Math.round(lowColor[1] + (highColor[1] - lowColor[1]) * t),
+                    Math.round(lowColor[2] + (highColor[2] - lowColor[2]) * t)
                 );
+                colorCache.set(elevationValue, color);
+                return color;
             }
         }
         return '#53463a';
@@ -148,37 +152,7 @@ export function createTerrainController({ map, state, dbg, logPrompt }) {
         return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
     }
 
-    function buildTerrainFillData() {
-        const features = [];
-        for (let y = 0; y < height - 1; y++) {
-            for (let x = 0; x < width - 1; x++) {
-                const tl = valueAt(x, y);
-                const tr = valueAt(x + 1, y);
-                const br = valueAt(x + 1, y + 1);
-                const bl = valueAt(x, y + 1);
-                if (tl == null || tr == null || br == null || bl == null) continue;
-                const avg = (tl + tr + br + bl) / 4;
-                const coords = [
-                    [lonForX(x), latForY(y)],
-                    [lonForX(x + 1), latForY(y)],
-                    [lonForX(x + 1), latForY(y + 1)],
-                    [lonForX(x), latForY(y + 1)],
-                    [lonForX(x), latForY(y)]
-                ];
-                features.push({
-                    type: 'Feature',
-                    properties: {
-                        elevation: avg,
-                        color: interpolatedColor(avg)
-                    },
-                    geometry: { type: 'Polygon', coordinates: [coords] }
-                });
-            }
-        }
-        return { type: 'FeatureCollection', features };
-    }
-
-    function buildTerrainExtrusionData() {
+    function buildTerrainData() {
         const features = [];
         for (let y = 0; y < height - 1; y++) {
             for (let x = 0; x < width - 1; x++) {
@@ -199,6 +173,7 @@ export function createTerrainController({ map, state, dbg, logPrompt }) {
                 features.push({
                     type: 'Feature',
                     properties: {
+                        elevation: avg,
                         height: heightValue,
                         color: interpolatedColor(avg),
                         base: 0
@@ -215,38 +190,55 @@ export function createTerrainController({ map, state, dbg, logPrompt }) {
         const startLevel = Math.ceil(minElevation / contourStep) * contourStep;
         const endLevel = Math.floor(maxElevation / contourStep) * contourStep;
 
-        for (let level = startLevel; level <= endLevel; level += contourStep) {
-            for (let y = 0; y < height - 1; y++) {
-                for (let x = 0; x < width - 1; x++) {
-                    const tl = valueAt(x, y);
-                    const tr = valueAt(x + 1, y);
-                    const br = valueAt(x + 1, y + 1);
-                    const bl = valueAt(x, y + 1);
-                    if (tl == null || tr == null || br == null || bl == null) continue;
+        for (let y = 0; y < height - 1; y++) {
+            for (let x = 0; x < width - 1; x++) {
+                const tl = valueAt(x, y);
+                const tr = valueAt(x + 1, y);
+                const br = valueAt(x + 1, y + 1);
+                const bl = valueAt(x, y + 1);
+                if (tl == null || tr == null || br == null || bl == null) continue;
+                const lowLevel = Math.max(startLevel, Math.ceil(Math.min(tl, tr, br, bl) / contourStep) * contourStep);
+                const highLevel = Math.min(endLevel, Math.floor(Math.max(tl, tr, br, bl) / contourStep) * contourStep);
 
-                    const edges = [
-                        { a: [lonForX(x), latForY(y)], b: [lonForX(x + 1), latForY(y)], va: tl, vb: tr },
-                        { a: [lonForX(x + 1), latForY(y)], b: [lonForX(x + 1), latForY(y + 1)], va: tr, vb: br },
-                        { a: [lonForX(x + 1), latForY(y + 1)], b: [lonForX(x), latForY(y + 1)], va: br, vb: bl },
-                        { a: [lonForX(x), latForY(y + 1)], b: [lonForX(x), latForY(y)], va: bl, vb: tl }
-                    ];
-
-                    const crossings = [];
-                    for (const edge of edges) {
-                        const aboveA = edge.va >= level;
-                        const aboveB = edge.vb >= level;
-                        if (aboveA === aboveB) continue;
-                        const ratio = Math.abs(edge.va - level) / Math.abs(edge.va - edge.vb || 1);
-                        const lon = edge.a[0] + (edge.b[0] - edge.a[0]) * ratio;
-                        const lat = edge.a[1] + (edge.b[1] - edge.a[1]) * ratio;
-                        crossings.push([lon, lat]);
+                for (let level = lowLevel; level <= highLevel; level += contourStep) {
+                    let first = null;
+                    let second = null;
+                    let crossingCount = 0;
+                    for (let edge = 0; edge < 4; edge++) {
+                        let valueA, valueB, lon, lat;
+                        if (edge === 0) {
+                            valueA = tl; valueB = tr;
+                        } else if (edge === 1) {
+                            valueA = tr; valueB = br;
+                        } else if (edge === 2) {
+                            valueA = br; valueB = bl;
+                        } else {
+                            valueA = bl; valueB = tl;
+                        }
+                        if ((valueA >= level) === (valueB >= level)) continue;
+                        const ratio = Math.abs(valueA - level) / Math.abs(valueA - valueB || 1);
+                        if (edge === 0) {
+                            lon = lonForX(x + ratio);
+                            lat = latForY(y);
+                        } else if (edge === 1) {
+                            lon = lonForX(x + 1);
+                            lat = latForY(y + ratio);
+                        } else if (edge === 2) {
+                            lon = lonForX(x + 1 - ratio);
+                            lat = latForY(y + 1);
+                        } else {
+                            lon = lonForX(x);
+                            lat = latForY(y + 1 - ratio);
+                        }
+                        if (crossingCount === 0) first = [lon, lat];
+                        else if (crossingCount === 1) second = [lon, lat];
+                        crossingCount++;
                     }
-
-                    if (crossings.length >= 2) {
+                    if (crossingCount >= 2) {
                         features.push({
                             type: 'Feature',
                             properties: { elevation: level },
-                            geometry: { type: 'LineString', coordinates: crossings.slice(0, 2) }
+                            geometry: { type: 'LineString', coordinates: [first, second] }
                         });
                     }
                 }
@@ -296,12 +288,6 @@ export function createTerrainController({ map, state, dbg, logPrompt }) {
                 data: { type: 'FeatureCollection', features: [] }
             });
         }
-        if (!map.getSource(DEM_EXTRUSION_SOURCE_ID)) {
-            map.addSource(DEM_EXTRUSION_SOURCE_ID, {
-                type: 'geojson',
-                data: { type: 'FeatureCollection', features: [] }
-            });
-        }
         if (!map.getSource(CONTOUR_SOURCE_ID)) {
             map.addSource(CONTOUR_SOURCE_ID, {
                 type: 'geojson',
@@ -329,7 +315,7 @@ export function createTerrainController({ map, state, dbg, logPrompt }) {
             map.addLayer({
                 id: DEM_EXTRUSION_LAYER_ID,
                 type: 'fill-extrusion',
-                source: DEM_EXTRUSION_SOURCE_ID,
+                source: DEM_SOURCE_ID,
                 minzoom: 15,
                 paint: {
                     'fill-extrusion-color': ['coalesce', ['get', 'color'], '#b7dca1'],
@@ -356,21 +342,25 @@ export function createTerrainController({ map, state, dbg, logPrompt }) {
 
         positionTerrainLayers();
 
-        const demSource = map.getSource(DEM_SOURCE_ID);
-        if (demSource) demSource.setData(buildTerrainFillData());
-
-        const demExtrusionSource = map.getSource(DEM_EXTRUSION_SOURCE_ID);
-        if (demExtrusionSource) demExtrusionSource.setData(buildTerrainExtrusionData());
-
-        const contourSource = map.getSource(CONTOUR_SOURCE_ID);
-        if (contourSource) contourSource.setData(buildContourData());
-
+        terrainLayersReady = true;
+        if (state.terrainVisible) ensureTerrainData();
         updateVisibility();
+    }
+
+    function ensureTerrainData() {
+        if (terrainDataLoaded || !terrainLayersReady) return;
+        const demSource = map.getSource(DEM_SOURCE_ID);
+        const contourSource = map.getSource(CONTOUR_SOURCE_ID);
+        if (!demSource || !contourSource) return;
+        demSource.setData(buildTerrainData());
+        contourSource.setData(buildContourData());
+        terrainDataLoaded = true;
         dbg(`Terrain DEM: ${width}x${height} (${minElevation}–${maxElevation}m, ${terrainSurveyData.pointsCount} points)`);
     }
 
     function setEnabled(nextValue) {
         state.terrainVisible = !!nextValue;
+        if (state.terrainVisible) ensureTerrainData();
         updateVisibility();
         logPrompt('bot', state.terrainVisible ? 'Terrain ON.' : 'Terrain OFF.');
     }

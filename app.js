@@ -8,7 +8,7 @@ import {
   canonicalZoneClass, parseZoneArgs, parseBuildingArgs
 } from './src/helpers.js';
 import {
-  preparePath, stitchRoadSegments, randomCarColor, samplePathPosition, carRect
+  preparePath, stitchRoadSegments, randomCarColor, samplePathPosition, carRects
 } from './src/traffic.js';
 import {
   syntheticBuildingId, buildingKey, customBuildingFeature,
@@ -33,6 +33,7 @@ import { trafficDemandAt } from './src/traffic-demand.js';
 import { createZoneController } from './src/zones.js';
 import { createTerrainController } from './src/terrain-survey.js';
 import { createGeminiAssistant } from './src/gemini-assistant.js';
+import { preloadRegionTiles } from './src/tile-preloader.js';
 
   const MAX_BUILDING_LABELS = 10000;
   const CUSTOM_BUILDINGS_STORAGE_KEY = 'maplibre-custom-buildings-v1';
@@ -68,6 +69,76 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
   updateMapClock();
   setInterval(updateMapClock, 1000);
   const { dbg, setExpanded } = createDebugController({ statusEl, statusBodyEl, statusToggleEl });
+  const loadingScreen = document.getElementById('loading-screen');
+  const loadingMessage = document.getElementById('loading-message');
+  const loadingProgress = document.getElementById('loading-progress');
+  const loadingProgressFill = document.getElementById('loading-progress-fill');
+  let loadingProgressValue = 0;
+  let welcomeAudioContext = null;
+  let welcomeChimePlayed = false;
+  let welcomeChimeGestureArmed = false;
+  function armWelcomeChimeGesture() {
+      if (welcomeChimeGestureArmed || welcomeChimePlayed) return;
+      welcomeChimeGestureArmed = true;
+      const retry = () => {
+          welcomeChimeGestureArmed = false;
+          window.removeEventListener('pointerdown', retry, true);
+          window.removeEventListener('keydown', retry, true);
+          void playWelcomeChime();
+      };
+      window.addEventListener('pointerdown', retry, true);
+      window.addEventListener('keydown', retry, true);
+  }
+  async function playWelcomeChime() {
+      if (welcomeChimePlayed) return;
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) {
+          dbg('Welcome sound unavailable: Web Audio is not supported by this browser.');
+          return;
+      }
+      try {
+          welcomeAudioContext ||= new AudioContextClass();
+          if (welcomeAudioContext.state !== 'running') await welcomeAudioContext.resume();
+          if (welcomeAudioContext.state !== 'running') {
+              armWelcomeChimeGesture();
+              return;
+          }
+          welcomeChimePlayed = true;
+          const startAt = welcomeAudioContext.currentTime + 0.02;
+          [587.33, 739.99, 880, 1174.66].forEach((frequency, index) => {
+              const start = startAt + index * 0.105;
+              const oscillator = welcomeAudioContext.createOscillator();
+              const volume = welcomeAudioContext.createGain();
+              oscillator.type = 'sine';
+              oscillator.frequency.setValueAtTime(frequency, start);
+              volume.gain.setValueAtTime(0.0001, start);
+              volume.gain.exponentialRampToValueAtTime(0.045, start + 0.025);
+              volume.gain.exponentialRampToValueAtTime(0.0001, start + 0.27);
+              oscillator.connect(volume);
+              volume.connect(welcomeAudioContext.destination);
+              oscillator.start(start);
+              oscillator.stop(start + 0.28);
+          });
+      } catch (error) {
+          dbg(`Welcome sound could not play: ${error.message}`);
+          armWelcomeChimeGesture();
+      }
+  }
+  function setLoadingProgress(value, message) {
+      loadingProgressValue = Math.max(loadingProgressValue, Math.max(0, Math.min(100, value)));
+      loadingProgress.setAttribute('aria-valuenow', String(loadingProgressValue));
+      loadingProgressFill.style.width = `${loadingProgressValue}%`;
+      loadingMessage.textContent = message;
+  }
+  function finishLoading() {
+      setLoadingProgress(100, 'Your city is ready.');
+      setTimeout(() => {
+          loadingScreen.classList.add('is-hidden');
+          loadingScreen.setAttribute('aria-hidden', 'true');
+          void playWelcomeChime();
+      }, 350);
+  }
+  setLoadingProgress(8, 'Starting SuliTwin…');
   statusToggleEl.addEventListener('click', e => {
       e.stopPropagation(); setExpanded(!statusEl.classList.contains('expanded'));
   });
@@ -93,6 +164,7 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
       maxBounds: [[REGION[0], REGION[1]], [REGION[2], REGION[3]]],
       minZoom: 15,
       maxZoom: 19,
+      maxTileCacheSize: 64,
       canvasContextAttributes: {antialias: true},
       transformRequest: (url, resourceType) => {
           if (resourceType !== 'Tile') return { url };
@@ -104,6 +176,8 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
           return { url: 'data:application/x-protobuf;base64,' };
       }
   });
+  map.scrollZoom.setWheelZoomRate(1 / 600);
+  map.scrollZoom.setZoomRate(1 / 140);
   const mapShadesController = createMapShadesController({ map, dbg });
   const buildingEditor = createBuildingEditorController({ map, dbg });
   window.map = map;
@@ -276,6 +350,11 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
   const trafficCars = [];
   const TRAFFIC_MIN_GAP_METERS = 5.5;
   const TRAFFIC_UPDATE_INTERVAL_MS = 50;
+  const TRAFFIC_SPEED_RANGES = {
+      motorway: [18, 26], trunk: [14, 21], primary: [11, 17],
+      secondary: [9, 14], tertiary: [7, 12]
+  };
+  const TRAFFIC_CABIN_PROPERTIES = { part: 'cabin', color: '#1f2937' };
   let trafficTargetCount = 0;
   let trafficRafId = null;
   let trafficLastT = 0;
@@ -1127,7 +1206,7 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
           for (let distance = 0; distance < path.length; distance += sampleSpacing) {
               const position = samplePathPosition(path, distance, 1, 0);
               if (!isInVisibleMapArea(position.pos, 3)) continue;
-              visibleRoadSpawnLocations.push({ path, distance });
+              visibleRoadSpawnLocations.push({ path, distance, pos: position.pos });
           }
       }
   }
@@ -1141,8 +1220,7 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
       let alternate = null;
       let nearestDistance = Infinity;
       for (const location of visibleRoadSpawnLocations) {
-          const position = samplePathPosition(location.path, location.distance, 1, 0).pos;
-          const distance = haversineMeters(fromPosition[0], fromPosition[1], position[0], position[1]);
+          const distance = haversineMeters(fromPosition[0], fromPosition[1], location.pos[0], location.pos[1]);
           if (distance < nearestDistance) {
               nearestDistance = distance;
               alternate = location;
@@ -1162,6 +1240,7 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
   }
 
   function rerouteCarsOnUnavailablePaths(previousPathsById = new Map()) {
+      let changed = false;
       for (const car of trafficCars) {
           if (roadPaths.has(car.pathId) && !car.returnPath) continue;
           if (!car.returnPath) {
@@ -1171,20 +1250,23 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
               car.returnTarget = car.t <= oldPath.length / 2 ? 0 : oldPath.length;
               car.direction = car.returnTarget === 0 ? -1 : 1;
               car.laneOffset = -car.direction * 1.8;
+              changed = true;
           }
           const atEndpoint = car.returnTarget === 0 ? car.t <= 0.5 : car.t >= car.returnPath.length - 0.5;
           if (atEndpoint) {
               const endpoint = samplePathPosition(car.returnPath, car.returnTarget, car.direction, 0).pos;
-              transferCarToOpenRoad(car, endpoint);
+              changed = transferCarToOpenRoad(car, endpoint) || changed;
           } else {
               const position = samplePathPosition(car.returnPath, car.t, car.direction, car.laneOffset);
               car.pos = position.pos;
               car.heading = position.heading;
           }
       }
-      const count = document.getElementById('traffic-count');
-      if (count) count.textContent = String(trafficCars.length);
-      updateTrafficLayer();
+      if (changed) {
+          const count = document.getElementById('traffic-count');
+          if (count) count.textContent = String(trafficCars.length);
+          updateTrafficLayer();
+      }
   }
 
   function spawnCar() {
@@ -1193,14 +1275,12 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
       const chosen = spawnLocation?.path;
       if (!chosen) return null;
       const direction = Math.random() < 0.5 ? 1 : -1;
-      const speedRanges = {
-          motorway: [18, 26], trunk: [14, 21], primary: [11, 17],
-          secondary: [9, 14], tertiary: [7, 12]
-      };
-      const [minSpeed, maxSpeed] = speedRanges[chosen.cls] || [5, 10];
+      const [minSpeed, maxSpeed] = TRAFFIC_SPEED_RANGES[chosen.cls] || [5, 10];
       const laneOffset = -direction * 1.8;
       const t = spawnLocation.distance;
       const position = samplePathPosition(chosen, t, direction, laneOffset);
+      const color = randomCarColor();
+      const colorCss = `rgb(${color[0]},${color[1]},${color[2]})`;
       return {
           id: `car-${++carIdCounter}`,
           pathId: chosen.id,
@@ -1208,7 +1288,9 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
           speed: minSpeed + Math.random() * (maxSpeed - minSpeed),
           direction,
           laneOffset,
-          color: randomCarColor(),
+          color,
+          bodyProperties: { part: 'body', color: colorCss },
+          cabinProperties: TRAFFIC_CABIN_PROPERTIES,
           pos: position.pos,
           heading: position.heading,
           returnPath: null,
@@ -1313,17 +1395,16 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
       for (const car of trafficCars) {
           const [lon, lat] = car.pos;
           if (lon < west - lonPadding || lon > east + lonPadding || lat < south - latPadding || lat > north + latPadding) continue;
-          const [r, g, b] = car.color;
-          const col = `rgb(${r},${g},${b})`;
+          const [body, cabin] = carRects(car);
           features.push({
               type: 'Feature',
-              properties: { part: 'body', color: col },
-              geometry: { type: 'Polygon', coordinates: [carRect(car, 0, 4.2, 1.8)] }
+              properties: car.bodyProperties,
+              geometry: { type: 'Polygon', coordinates: [body] }
           });
           features.push({
               type: 'Feature',
-              properties: { part: 'cabin', color: '#1f2937' },
-              geometry: { type: 'Polygon', coordinates: [carRect(car, -0.3, 2.2, 1.6)] }
+              properties: car.cabinProperties,
+              geometry: { type: 'Polygon', coordinates: [cabin] }
           });
       }
       src.setData({ type: 'FeatureCollection', features });
@@ -1620,16 +1701,38 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
           refreshBuildings();
           if (state.buildingLabels) updateBuildingLabels();
           extractRoadPathsFromTiles();
-          if (trafficTargetCount > 0) adjustTrafficCount(trafficTargetCount);
+          if (trafficCars.length < trafficTargetCount) adjustTrafficCount(trafficTargetCount);
       }, delayMs);
   }
 
   let initialPopulateDone = false;
-  map.on('idle', () => {
-      if (initialPopulateDone) return;
-      initialPopulateDone = true;
+  let initialBuildingDataReady = false;
+  let resolveInitialPopulation;
+  const initialPopulationReady = new Promise(resolve => {
+      resolveInitialPopulation = resolve;
+  });
+  let waitingForInitialBuildingRender = false;
+  function populateInitialBuildings() {
+      if (initialPopulateDone || !map.getSource('openfreemap') || !map.isSourceLoaded('openfreemap')) return;
       refreshBuildings();
+      if (cachedOsmVisibleEntries.length === 0) {
+          setLoadingProgress(66, 'Loading building data…');
+          return;
+      }
+      initialPopulateDone = true;
+      initialBuildingDataReady = true;
       if (state.buildingLabels) updateBuildingLabels();
+      setLoadingProgress(66, 'Populating buildings and map details…');
+      waitingForInitialBuildingRender = true;
+      map.once('idle', () => {
+          if (!waitingForInitialBuildingRender) return;
+          waitingForInitialBuildingRender = false;
+          resolveInitialPopulation();
+      });
+  }
+  map.on('idle', populateInitialBuildings);
+  map.on('sourcedata', event => {
+      if (event.sourceId === 'openfreemap' && event.isSourceLoaded) populateInitialBuildings();
   });
   map.on('moveend', () => scheduleRefreshBuildings(300));
 
@@ -3236,6 +3339,8 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
 
   map.on('load', () => {
       dbg('Map loaded.');
+      setLoadingProgress(35, 'Loading map layers…');
+      const weatherReady = weather.update();
       map.setLight({ anchor: 'viewport', color: '#ffffff', intensity: 0.6, position: [1.15, 210, 30] });
 
       detectFontStack();
@@ -3279,7 +3384,8 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
           refreshZones();
       }
 
-      parkController.buildAllParks();
+      setLoadingProgress(48, 'Loading city landmarks…');
+      const parksReady = parkController.buildAllParks();
 
       map.on('styledata', () => {
           schedulePositionRoadLayers();
@@ -3293,6 +3399,36 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
       // Traffic setup
       setupTrafficOverlay();
       mapShadesController.apply();
+      setLoadingProgress(58, 'Preparing map tiles…');
+      void initialPopulationReady.then(() => {
+          setLoadingProgress(76, 'Finishing map setup…');
+      });
+      void parksReady.then(() => {
+          setLoadingProgress(84, 'Finishing map setup…');
+      });
+      void Promise.allSettled([initialPopulationReady, parksReady, weatherReady])
+          .then(results => {
+              for (const result of results) {
+                  if (result.status === 'rejected') {
+                      dbg(`Startup task failed: ${result.reason?.message || result.reason}`);
+                  }
+              }
+              finishLoading();
+              const preloadTilesWhenIdle = () => {
+                  if (map.isMoving()) {
+                      map.once('idle', preloadTilesWhenIdle);
+                      return;
+                  }
+                  setTimeout(() => {
+                      if (map.isMoving()) {
+                          map.once('idle', preloadTilesWhenIdle);
+                          return;
+                      }
+                      void preloadRegionTiles({ map, region: REGION, dbg });
+                  }, 8000);
+              };
+              preloadTilesWhenIdle();
+          });
     setInterval(updateTrafficDemand, 30000);
 
       extractRoadPathsFromTiles();
@@ -3305,17 +3441,10 @@ import { createGeminiAssistant } from './src/gemini-assistant.js';
       }
 
       setTimeout(() => {
-          if (!initialPopulateDone) {
-              initialPopulateDone = true;
-              refreshBuildings();
-              if (state.buildingLabels) updateBuildingLabels();
-          } else {
-              refreshBuildings();
-              if (state.buildingLabels) updateBuildingLabels();
-          }
+          reportTileStats(true);
+          if (!initialBuildingDataReady) populateInitialBuildings();
       }, 1500);
 
-      setTimeout(() => reportTileStats(true), 1500);
       logPrompt('info', 'Ready. Haze follows live visibility, cast shadows ON, traffic available.');
     logPrompt('info', 'Traffic count follows the estimated Sulaimani time-of-day profile. Type "traffic status" for details.');
       logPrompt('info', 'Type "help" for the full command list.');

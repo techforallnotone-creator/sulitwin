@@ -1,5 +1,7 @@
 import { haversineMeters } from './helpers.js';
 
+const RECT_CORNERS = [[1, 1], [1, -1], [-1, -1], [-1, 1]];
+
 export function preparePath(coords, cls) {
   const cum = [0];
   let total = 0;
@@ -99,17 +101,34 @@ export function samplePathPosition(path, t, direction, laneOffset) {
 }
 
 export function carRect(car, fwdOffset, length, width) {
-  const [lon, lat] = car.pos;
+  const [, lat] = car.pos;
   const h = car.heading * Math.PI / 180;
   const mLat = 111320, mLon = 111320 * Math.cos(lat * Math.PI / 180);
   const fx = Math.sin(h), fy = Math.cos(h);
+  return carRectFromBasis(car, fwdOffset, length, width, fx, fy, mLon, mLat);
+}
+
+function carRectFromBasis(car, fwdOffset, length, width, fx, fy, mLon, mLat) {
+  const [lon, lat] = car.pos;
   const rx = fy, ry = -fx;
   const ring = [];
-  for (const [sf, sr] of [[1, 1], [1, -1], [-1, -1], [-1, 1]]) {
+  for (const [sf, sr] of RECT_CORNERS) {
     const f = fwdOffset + sf * length / 2;
     const r = sr * width / 2;
     ring.push([lon + (fx * f + rx * r) / mLon, lat + (fy * f + ry * r) / mLat]);
   }
   ring.push(ring[0]);
   return ring;
+}
+
+export function carRects(car) {
+  const [, lat] = car.pos;
+  const h = car.heading * Math.PI / 180;
+  const mLat = 111320;
+  const mLon = 111320 * Math.cos(lat * Math.PI / 180);
+  const fx = Math.sin(h), fy = Math.cos(h);
+  return [
+    carRectFromBasis(car, 0, 4.2, 1.8, fx, fy, mLon, mLat),
+    carRectFromBasis(car, -0.3, 2.2, 1.6, fx, fy, mLon, mLat)
+  ];
 }

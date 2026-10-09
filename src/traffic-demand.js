@@ -1,5 +1,14 @@
 const TIME_ZONE = 'Asia/Baghdad';
 const MAX_VISIBLE_CARS = 300;
+const LOCAL_TIME_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  timeZone: TIME_ZONE,
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+  hour: 'numeric',
+  minute: 'numeric',
+  hourCycle: 'h23'
+});
 
 const DAY_FACTORS = [1, 1, 1, 1.02, 1.05, 0.55, 0.8];
 const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -48,16 +57,10 @@ const SUMMER_PROFILE = {
   ]
 };
 
+const maximumDemandByProfile = new WeakMap();
+
 function localParts(timestamp) {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: TIME_ZONE,
-    year: 'numeric',
-    month: 'numeric',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: 'numeric',
-    hourCycle: 'h23'
-  }).formatToParts(timestamp);
+  const parts = LOCAL_TIME_FORMATTER.formatToParts(timestamp);
   return Object.fromEntries(parts.filter(part => part.type !== 'literal').map(part => [part.type, Number(part.value)]));
 }
 
@@ -87,6 +90,17 @@ function rawDemand(hour, profile) {
     const distance = gaussianDistance(hour, peak.center);
     return sum + peak.height * Math.exp(-(distance * distance) / (2 * peak.width * peak.width));
   }, 0);
+}
+
+function maximumDemand(profile) {
+  let maximum = maximumDemandByProfile.get(profile);
+  if (maximum !== undefined) return maximum;
+  maximum = 0;
+  for (let minute = 0; minute < 1440; minute += 5) {
+    maximum = Math.max(maximum, rawDemand(minute / 60, profile));
+  }
+  maximumDemandByProfile.set(profile, maximum);
+  return maximum;
 }
 
 function peakName(hour, day, season) {
@@ -120,11 +134,7 @@ export function trafficDemandAt(timestamp = new Date()) {
   const hour = snapped.getUTCHours() + snapped.getUTCMinutes() / 60;
   const { profile, season, seasonFactor } = profileFor(day, month);
 
-  let maximumDemand = 0;
-  for (let minute = 0; minute < 1440; minute += 5) {
-    maximumDemand = Math.max(maximumDemand, rawDemand(minute / 60, profile));
-  }
-  const demandFactor = rawDemand(hour, profile) / maximumDemand;
+  const demandFactor = rawDemand(hour, profile) / maximumDemand(profile);
   const seasonalDemand = demandFactor * DAY_FACTORS[day] * seasonFactor;
   const count = Math.min(MAX_VISIBLE_CARS, Math.max(0, Math.round(MAX_VISIBLE_CARS * seasonalDemand)));
   const label = peakName(hour, day, season);

@@ -1,6 +1,60 @@
 html, body { margin: 0; padding: 0; height: 100%; }
       body { background: #000; overflow: hidden; }
       #map { width: 100%; height: 100%; }
+      #loading-screen {
+          position: fixed; inset: 0; z-index: 1000;
+          display: grid; place-items: center; padding: 20px;
+          background: rgba(10, 28, 52, 0.72);
+          font-family: Tahoma, "Segoe UI", sans-serif;
+          opacity: 1; visibility: visible;
+          transition: opacity .35s ease, visibility .35s ease;
+      }
+      #loading-screen.is-hidden {
+          opacity: 0; visibility: hidden; pointer-events: none;
+      }
+      .loading-window {
+          width: min(390px, 100%);
+          border: 1px solid #083c9c; border-radius: 8px 8px 4px 4px;
+          background: #ece9d8;
+          box-shadow: 0 18px 55px rgba(0, 0, 0, .5);
+          overflow: hidden;
+      }
+      .loading-titlebar {
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 7px 9px 8px 12px;
+          color: #fff; font-size: 13px; font-weight: 700;
+          text-shadow: 1px 1px 1px #123779;
+          background: linear-gradient(180deg, #3b8cf4 0%, #1764d6 48%, #0d54c3 52%, #2878e8 100%);
+      }
+      .loading-titlebar-icon {
+          display: grid; place-items: center; width: 20px; height: 19px;
+          border: 1px solid #fff; border-radius: 3px;
+          background: linear-gradient(#f58c7d, #d82918);
+          font: bold 12px/1 Arial, sans-serif;
+          box-shadow: 0 1px 2px rgba(0,0,0,.35);
+      }
+      .loading-content { padding: 22px 25px 19px; color: #222; }
+      .loading-content h1 {
+          margin: 0 0 6px; color: #174e9b;
+          font-size: 25px; letter-spacing: -.5px;
+      }
+      .loading-content p { margin: 0 0 17px; font-size: 13px; }
+      .xp-progress {
+          height: 20px; padding: 2px;
+          border: 1px solid #7f9db9; border-radius: 2px;
+          background: #fff; box-shadow: inset 1px 1px 2px rgba(0,0,0,.18);
+          overflow: hidden;
+      }
+      .xp-progress-fill {
+          width: 5%; height: 100%;
+          background: repeating-linear-gradient(90deg,
+              #28a525 0, #28a525 12px, transparent 12px, transparent 16px);
+          transition: width .45s ease;
+      }
+      .loading-caption { margin-top: 10px; color: #555; font-size: 11px; }
+      @media (prefers-reduced-motion: reduce) {
+          #loading-screen, .xp-progress-fill { transition: none; }
+      }
       #visibility-overlay {
           position: absolute; inset: 0; pointer-events: none; z-index: 2;
           background: linear-gradient(180deg, #e8eef4 0%, #dfe6ee 100%);
