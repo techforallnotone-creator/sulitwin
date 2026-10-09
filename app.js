@@ -775,6 +775,7 @@ import { createTerrainController } from './src/terrain-survey.js';
 
   function spawnCar() {
       const spawnLocation = chooseRoadSpawnLocation();
+      if (trafficCars.length >= 300) return null;
       const chosen = spawnLocation?.path;
       if (!chosen) return null;
       const direction = Math.random() < 0.5 ? 1 : -1;
@@ -808,7 +809,8 @@ import { createTerrainController } from './src/terrain-survey.js';
           trafficCars.push(c);
       }
       while (trafficCars.length > target) {
-          const removableIndex = trafficCars.findLastIndex(car => !car.returnPath);
+          let removableIndex = trafficCars.length - 1;
+          while (removableIndex >= 0 && trafficCars[removableIndex].returnPath) removableIndex--;
           if (removableIndex === -1) break;
           trafficCars.splice(removableIndex, 1);
       }
@@ -878,7 +880,8 @@ import { createTerrainController } from './src/terrain-survey.js';
               const follower = cars[i];
               if (direction > 0) follower.t = Math.min(follower.t, Math.max(0, leader.t - TRAFFIC_MIN_GAP_METERS));
               else {
-                  const path = roadPaths.get(follower.pathId);
+                  const path = roadPaths.get(follower.pathId) || follower.returnPath;
+                  if (!path) continue;
                   follower.t = Math.max(follower.t, Math.min(path.length, leader.t + TRAFFIC_MIN_GAP_METERS));
               }
           }
@@ -918,28 +921,6 @@ import { createTerrainController } from './src/terrain-survey.js';
           });
       }
       src.setData({ type: 'FeatureCollection', features });
-  }
-
-  function isCarOnClosedRoad(car) {
-      if (!closedRoadSegments.size) return false;
-      const [lon, lat] = car.pos;
-      const metersPerLongitude = 111320 * Math.cos(lat * Math.PI / 180);
-      for (const road of closedRoadSegments.values()) {
-          for (let i = 1; i < road.coords.length; i++) {
-              const start = road.coords[i - 1];
-              const end = road.coords[i];
-              const dx = (end[0] - start[0]) * metersPerLongitude;
-              const dy = (end[1] - start[1]) * 111320;
-              const lengthSquared = dx * dx + dy * dy;
-              const carX = (lon - start[0]) * metersPerLongitude;
-              const carY = (lat - start[1]) * 111320;
-              const fraction = lengthSquared
-                  ? Math.max(0, Math.min(1, (carX * dx + carY * dy) / lengthSquared))
-                  : 0;
-              if (Math.hypot(carX - fraction * dx, carY - fraction * dy) <= 3.5) return true;
-          }
-      }
-      return false;
   }
 
   function setupTrafficOverlay() {
@@ -2713,6 +2694,15 @@ import { createTerrainController } from './src/terrain-survey.js';
       mapShadesController.apply();
     setInterval(updateTrafficDemand, 30000);
 
+      extractRoadPathsFromTiles();
+      updateTrafficDemand();
+      if (roadPaths.size === 0) {
+          map.once('idle', () => {
+              extractRoadPathsFromTiles();
+              updateTrafficDemand();
+          });
+      }
+
       setTimeout(() => {
           if (!initialPopulateDone) {
               initialPopulateDone = true;
@@ -2721,14 +2711,6 @@ import { createTerrainController } from './src/terrain-survey.js';
           } else {
               refreshBuildings();
               if (state.buildingLabels) updateBuildingLabels();
-          }
-          extractRoadPathsFromTiles();
-          updateTrafficDemand();
-          if (roadPaths.size === 0) {
-              map.once('idle', () => {
-                  extractRoadPathsFromTiles();
-                  updateTrafficDemand();
-              });
           }
       }, 1500);
 
