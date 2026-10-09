@@ -51,24 +51,26 @@
   </div>
 </div>
 
-<div id="tools-drawer">
+<div id="tools-drawer" class="collapsed">
   <div id="map-tools" aria-label="Map tools">
     <button id="building-build-btn" type="button">🏗️ Build building</button>
     <button id="building-delete-btn" type="button">🗑️ Delete building</button>
     <button id="building-edit-btn" type="button">✏️ Edit buildings</button>
     <button id="road-draw-btn" type="button">🛣️ Draw road</button>
     <button id="road-delete-btn" type="button">🗑️ Delete road</button>
+    <button id="road-close-btn" type="button">⛔ Close road</button>
+    <button id="road-open-btn" type="button">✅ Open road</button>
     <button id="zone-draw-btn" type="button">⭕ Draw zone</button>
     <button id="zone-delete-btn" type="button">🗑️ Delete zone</button>
     <button id="ao-toggle-btn" type="button">🌑 Shadows ON</button>
     <button id="terrain-toggle-btn" type="button">🗻 Terrain OFF</button>
-    <button id="building-labels-toggle-btn" type="button">🏷️ Building labels ON</button>
+    <button id="building-labels-toggle-btn" type="button">🏷️ Building labels OFF</button>
     <button id="tile-picker-btn" type="button">
       🗑️ Delete tiles<span id="tile-picker-count"></span>
     </button>
   </div>
 </div>
-<button id="tools-drawer-toggle" type="button" aria-label="Hide map tools" aria-expanded="true" aria-controls="map-tools" title="Hide map tools">›</button>
+<button id="tools-drawer-toggle" type="button" aria-label="Show map tools" aria-expanded="false" aria-controls="map-tools" title="Show map tools">‹</button>
 
 <div id="prompt-container">
   <div id="prompt-log"></div>

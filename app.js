@@ -18,6 +18,7 @@ import { createDebugController } from './src/debug.js';
 import { createWeatherController } from './src/weather.js';
 import { createParkController } from './src/parks.js';
 import { createMapOverlayHelpers } from './src/map-overlays.js';
+import { createMapShadesController } from './src/map-shades.js';
 import { createRoadLayerController, createRoadLifecycleController } from './src/road-layers.js';
 import {
   createBuildingEditorController,
@@ -101,6 +102,7 @@ import { createTerrainController } from './src/terrain-survey.js';
           return { url: 'data:application/x-protobuf;base64,' };
       }
   });
+  const mapShadesController = createMapShadesController({ map, dbg });
   const buildingEditor = createBuildingEditorController({ map, dbg });
   window.map = map;
 
@@ -112,11 +114,11 @@ import { createTerrainController } from './src/terrain-survey.js';
   const hiddenTiles = new Map();
   let tilePickerActive = false;
 
-  const drawnRoads = new Map();
+  let drawnRoads = new Map();
   let roadDrawActive = false;
   let draftCoords = [];
   let draftCursor = null;
-  let roadDrawColor = '#ff0000';
+  let roadDrawColor = '#16a34a';
   let roadDrawWidth = 6;
   let roadIdCounter = 0;
 
@@ -193,7 +195,11 @@ import { createTerrainController } from './src/terrain-survey.js';
       cancelBuilding,
       stopBuildingEdit,
     updateBuildingDraftData: setBuildingDraftData,
-    animateNewBuilding: (building) => buildingConstruction.start(building)
+    animateNewBuilding: (building) => {
+        if (isBuildingInVisibleMapArea(centerOfCoordinates(building.coords))) {
+            buildingConstruction.start(building);
+        }
+    }
   });
   const buildingSelection = createBuildingSelectionController({
       map,
@@ -258,15 +264,298 @@ import { createTerrainController } from './src/terrain-survey.js';
   const ROAD_SOURCE_LAYERS = ['transportation', 'road', 'roads'];
 
   const roadPaths = new Map();
-    const roadPathKeys = new Map();
-  let roadPathCounter = 0;
+  const roadPathKeys = new Map();
+  let visibleRoadSpawnLocations = [];
+  const closedRoadSegments = new Map();
   let carIdCounter = 0;
   const trafficCars = [];
-    const TRAFFIC_MIN_GAP_METERS = 5.5;
-    const TRAFFIC_UPDATE_INTERVAL_MS = 50;
+  const TRAFFIC_MIN_GAP_METERS = 5.5;
+  const TRAFFIC_UPDATE_INTERVAL_MS = 50;
   let trafficTargetCount = 0;
   let trafficRafId = null;
   let trafficLastT = 0;
+  let roadClosureMode = null;
+  const VISIBLE_MAP_RADIUS_METERS = FADE_OUTER_METERS * 0.3;
+
+  function isInVisibleMapArea(center, marginMeters = 0) {
+      return !!center &&
+          haversineMeters(CENTER[0], CENTER[1], center[0], center[1]) <= VISIBLE_MAP_RADIUS_METERS - marginMeters;
+  }
+
+  function roadSegmentKey(cls, coords) {
+      const points = coords.map(([lon, lat]) => `${lon.toFixed(5)},${lat.toFixed(5)}`);
+      const reversed = points.slice().reverse();
+      const forwardKey = points.join('|');
+      const reverseKey = reversed.join('|');
+      return `${cls}|${forwardKey < reverseKey ? forwardKey : reverseKey}`;
+  }
+
+  function roadFeatureClass(feature) {
+      const props = feature.properties || {};
+      return props.class || props.subclass || props.highway || props.type || null;
+  }
+
+  function midpointOfCoordinates(coords) {
+      const lengths = [];
+      let totalLength = 0;
+      for (let i = 1; i < coords.length; i++) {
+          const length = haversineMeters(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]);
+          lengths.push(length);
+          totalLength += length;
+      }
+      if (!totalLength) return coords[0].slice(0, 2);
+      let remaining = totalLength / 2;
+      for (let i = 0; i < lengths.length; i++) {
+          if (remaining <= lengths[i]) {
+              const fraction = lengths[i] ? remaining / lengths[i] : 0;
+              return [
+                  coords[i][0] + (coords[i + 1][0] - coords[i][0]) * fraction,
+                  coords[i][1] + (coords[i + 1][1] - coords[i][1]) * fraction
+              ];
+          }
+          remaining -= lengths[i];
+      }
+      return coords[coords.length - 1].slice(0, 2);
+  }
+
+  function refreshClosedRoadOverlay() {
+      if (!map.isStyleLoaded()) {
+          updateRoadClosureButtons();
+          return;
+      }
+      const roads = map.getSource('closed-roads-src');
+      const signs = map.getSource('closed-road-signs-src');
+      if (!roads || !signs) return;
+      const closed = [...closedRoadSegments.values()];
+      roads.setData({
+          type: 'FeatureCollection',
+          features: closed.map(road => ({
+              type: 'Feature',
+              properties: { key: road.key },
+              geometry: { type: 'LineString', coordinates: road.coords }
+          }))
+      });
+      signs.setData({
+          type: 'FeatureCollection',
+          features: closed.map(road => ({
+              type: 'Feature',
+              properties: { key: road.key, label: '×' },
+              geometry: { type: 'Point', coordinates: midpointOfCoordinates(road.coords) }
+          }))
+      });
+      updateRoadClosureButtons();
+  }
+
+  function ensureClosedRoadOverlay() {
+      if (!map.getSource('closed-roads-src')) {
+          map.addSource('closed-roads-src', {
+              type: 'geojson',
+              data: { type: 'FeatureCollection', features: [] }
+          });
+      }
+      if (!map.getSource('closed-road-signs-src')) {
+          map.addSource('closed-road-signs-src', {
+              type: 'geojson',
+              data: { type: 'FeatureCollection', features: [] }
+          });
+      }
+      if (!map.getLayer('closed-roads-line')) {
+          map.addLayer({
+              id: 'closed-roads-line',
+              type: 'line',
+              source: 'closed-roads-src',
+              layout: { 'line-cap': 'round', 'line-join': 'round' },
+              paint: {
+                  'line-color': '#dc2626',
+                  'line-width': ['interpolate', ['linear'], ['zoom'], 15, 5, 20, 12],
+                  'line-opacity': 1
+              }
+          });
+      }
+      if (!map.getLayer('closed-road-sign')) {
+          map.addLayer({
+              id: 'closed-road-sign',
+              type: 'circle',
+              source: 'closed-road-signs-src',
+              paint: {
+                  'circle-radius': 11,
+                  'circle-color': '#dc2626',
+                  'circle-stroke-color': '#ffffff',
+                  'circle-stroke-width': 2
+              }
+          });
+      }
+      if (!map.getLayer('closed-road-sign-bar')) {
+          map.addLayer({
+              id: 'closed-road-sign-bar',
+              type: 'symbol',
+              source: 'closed-road-signs-src',
+              layout: {
+                  'text-field': '×',
+                  'text-font': detectFontStack(),
+                  'text-size': 20,
+                  'text-allow-overlap': true,
+                  'text-ignore-placement': true
+              },
+              paint: { 'text-color': '#ffffff' }
+          });
+      }
+      positionClosedRoadLayers();
+      refreshClosedRoadOverlay();
+  }
+
+  function positionClosedRoadLayers() {
+      const layerIds = ['closed-roads-line', 'closed-road-sign', 'closed-road-sign-bar'];
+      const layers = map.getStyle().layers || [];
+      const existing = layerIds.filter(id => map.getLayer(id));
+      const start = layers.length - existing.length;
+      if (existing.every((id, index) => layers[start + index]?.id === id)) return;
+      for (const id of layerIds) {
+          if (map.getLayer(id)) map.moveLayer(id);
+      }
+  }
+
+  let closedRoadLayersPositionScheduled = false;
+  function schedulePositionClosedRoadLayers() {
+      if (closedRoadLayersPositionScheduled) return;
+      closedRoadLayersPositionScheduled = true;
+      requestAnimationFrame(() => {
+          closedRoadLayersPositionScheduled = false;
+          positionClosedRoadLayers();
+      });
+  }
+
+  function findBaseRoadFeatureAtPoint(point) {
+      let layers = [];
+      try {
+          layers = (map.getStyle().layers || [])
+              .filter(layer => layer.type === 'line' &&
+                  (layer.id === 'drawn-roads' ||
+                   (layer['source-layer'] && /transportation|road|street|highway/i.test(layer['source-layer']))) &&
+                  layer.id !== 'closed-roads-line')
+              .map(layer => layer.id);
+      } catch (error) {
+          dbg(`Road selection layers unavailable: ${error.message}`);
+          return null;
+      }
+      if (!layers.length) return null;
+      let hits;
+      try {
+          hits = map.queryRenderedFeatures(point, { layers });
+      } catch (error) {
+          dbg(`Road selection failed: ${error.message}`);
+          return null;
+      }
+      for (const feature of hits || []) {
+          const isDrawnRoad = feature.layer && feature.layer.id === 'drawn-roads';
+          const cls = isDrawnRoad ? 'street' : roadFeatureClass(feature);
+          if (!cls || !VEHICLE_CLASSES.has(cls)) continue;
+          const geometry = feature.geometry;
+          const lines = geometry && geometry.type === 'LineString' ? [geometry.coordinates]
+              : geometry && geometry.type === 'MultiLineString' ? geometry.coordinates
+              : [];
+          const line = lines.filter(coords => coords && coords.length >= 2)
+              .map(coords => {
+                  let distance = Infinity;
+                  for (let i = 1; i < coords.length; i++) {
+                      const a = map.project(coords[i - 1]);
+                      const b = map.project(coords[i]);
+                      const dx = b.x - a.x, dy = b.y - a.y;
+                      const lengthSquared = dx * dx + dy * dy;
+                      const t = lengthSquared
+                          ? Math.max(0, Math.min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared))
+                          : 0;
+                      distance = Math.min(distance, Math.hypot(point.x - (a.x + t * dx), point.y - (a.y + t * dy)));
+                  }
+                  return { coords, distance };
+              })
+              .sort((a, b) => a.distance - b.distance)[0]?.coords;
+          if (line) return { cls, coords: line };
+      }
+      return null;
+  }
+
+  function findClosedRoadAtPoint(point) {
+      if (!map.getLayer('closed-roads-line')) return null;
+      let hits;
+      try {
+          hits = map.queryRenderedFeatures(point, { layers: ['closed-roads-line'] });
+      } catch (error) {
+          dbg(`Closed road selection failed: ${error.message}`);
+          return null;
+      }
+      for (const feature of hits || []) {
+          const key = feature.properties && feature.properties.key;
+          if (key && closedRoadSegments.has(key)) return closedRoadSegments.get(key);
+      }
+      return null;
+  }
+
+  function setRoadClosureMode(mode) {
+      if (roadClosureMode === mode) {
+          roadClosureMode = null;
+          map.getCanvas().style.cursor = '';
+          updateRoadClosureButtons();
+          logPrompt('info', 'Road closure tool OFF.');
+          return;
+      }
+      if (roadDrawActive) cancelRoad();
+      if (roadDeleteActive) setRoadDeleteActive(false);
+      if (tilePickerActive) setTilePickerActive(false);
+      if (buildingDrawActive) cancelBuilding();
+      if (buildingEditActive) stopBuildingEdit();
+      if (buildingDeleteActive) setBuildingDeleteActive(false);
+      if (zoneDrawActive) cancelZone();
+      if (zoneDeleteActive) setZoneDeleteActive(false);
+
+      roadClosureMode = mode;
+      map.getCanvas().style.cursor = 'crosshair';
+      if (map.isStyleLoaded()) ensureClosedRoadOverlay();
+      updateRoadClosureButtons();
+      logPrompt('info', mode === 'close'
+          ? 'Road closing ON — click a road to close it and reroute traffic.'
+          : 'Road opening ON — click a closed road to reopen it.');
+  }
+
+  function closeRoadAtPoint(point) {
+      const road = findBaseRoadFeatureAtPoint(point);
+      if (!road) return logPrompt('info', 'No traffic road at that spot.');
+      const key = roadSegmentKey(road.cls, road.coords);
+      if (closedRoadSegments.has(key)) return logPrompt('info', 'That road segment is already closed.');
+      closedRoadSegments.set(key, { key, cls: road.cls, coords: road.coords });
+      refreshClosedRoadOverlay();
+      extractRoadPathsFromTiles();
+      updateTrafficDemand();
+      logPrompt('bot', 'Road closed; traffic has been rerouted onto open roads.');
+  }
+
+  function openRoadAtPoint(point) {
+      const road = findClosedRoadAtPoint(point);
+      if (!road) return logPrompt('info', 'No closed road at that spot.');
+      closedRoadSegments.delete(road.key);
+      refreshClosedRoadOverlay();
+      extractRoadPathsFromTiles();
+      updateTrafficDemand();
+      logPrompt('bot', 'Road reopened; traffic can use it again.');
+  }
+
+  function updateRoadClosureButtons() {
+      const closedCount = closedRoadSegments.size;
+      const closeButton = document.getElementById('road-close-btn');
+      const openButton = document.getElementById('road-open-btn');
+      if (closeButton) {
+          closeButton.textContent = roadClosureMode === 'close'
+              ? `⛔ Stop closing (${closedCount})`
+              : `⛔ Close road (${closedCount})`;
+          closeButton.classList.toggle('active', roadClosureMode === 'close');
+      }
+      if (openButton) {
+          openButton.textContent = roadClosureMode === 'open'
+              ? `✅ Stop opening (${closedCount})`
+              : `✅ Open road (${closedCount})`;
+          openButton.classList.toggle('active', roadClosureMode === 'open');
+      }
+  }
 
   // ---- Traffic extraction ----
   function vectorTileSourceIds() {
@@ -324,8 +613,7 @@ import { createTerrainController } from './src/terrain-survey.js';
   function collectLineSegments(feats, segments, seen, classCounts) {
       for (const f of feats) {
           if (!f.geometry) continue;
-          const props = f.properties || {};
-          const cls = props.class || props.subclass || props.highway || props.type;
+          const cls = roadFeatureClass(f);
           if (cls) classCounts.set(cls, (classCounts.get(cls) || 0) + 1);
           if (!cls || !VEHICLE_CLASSES.has(cls)) continue;
           const g = f.geometry;
@@ -336,7 +624,8 @@ import { createTerrainController } from './src/terrain-survey.js';
               if (!line || line.length < 2) continue;
               const a = line[0], b = line[line.length - 1];
               if (!a || !b || a.length < 2 || b.length < 2) continue;
-              const sig = `${cls}|${a[0].toFixed(5)},${a[1].toFixed(5)}|${b[0].toFixed(5)},${b[1].toFixed(5)}|${line.length}`;
+              const sig = roadSegmentKey(cls, line);
+              if (closedRoadSegments.has(sig)) continue;
               if (seen.has(sig)) continue;
               seen.add(sig);
               segments.push({ coords: line, cls });
@@ -380,29 +669,34 @@ import { createTerrainController } from './src/terrain-survey.js';
       }
 
       for (const r of drawnRoads.values()) {
-          if (r.coords && r.coords.length >= 2) {
+          if (r.coords && r.coords.length >= 2 && !closedRoadSegments.has(roadSegmentKey('street', r.coords))) {
               segments.push({ coords: r.coords, cls: 'street' });
           }
       }
 
       const stitched = stitchRoadSegments(segments);
-      if (trafficCars.length === 0) {
-          roadPaths.clear();
-          roadPathKeys.clear();
-          roadPathCounter = 0;
-      }
+      const previousPathsById = new Map(roadPaths);
+      const previousPaths = new Map([...roadPathKeys].map(([key, id]) => [key, roadPaths.get(id)]));
+      const nextPaths = new Map();
+      const nextPathKeys = new Map();
       for (const s of stitched) {
           const endpoints = [s.coords[0], s.coords[s.coords.length - 1]]
               .map(([lon, lat]) => `${lon.toFixed(5)},${lat.toFixed(5)}`)
               .sort();
           const key = `${s.cls}|${endpoints[0]}|${endpoints[1]}|${s.coords.length}`;
-          if (roadPathKeys.has(key)) continue;
-          const p = preparePath(s.coords, s.cls);
+          if (nextPathKeys.has(key)) continue;
+          const p = previousPaths.get(key) || preparePath(s.coords, s.cls);
           if (p.length >= 20) {
-              roadPaths.set(p.id, p);
-              roadPathKeys.set(key, p.id);
+              nextPaths.set(p.id, p);
+              nextPathKeys.set(key, p.id);
           }
       }
+      roadPaths.clear();
+      roadPathKeys.clear();
+      for (const [id, path] of nextPaths) roadPaths.set(id, path);
+      for (const [key, id] of nextPathKeys) roadPathKeys.set(key, id);
+      rebuildVisibleRoadSpawnLocations();
+      rerouteCarsOnUnavailablePaths(previousPathsById);
       const el = document.getElementById('traffic-roads');
       if (el) el.textContent = roadPaths.size;
       const classSummary = [...classCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)
@@ -411,32 +705,99 @@ import { createTerrainController } from './src/terrain-survey.js';
       return roadPaths.size;
   }
 
-  function spawnCar() {
-      const entries = [...roadPaths.values()].filter(p => p.length >= 40);
-      if (entries.length === 0) return null;
-      const totalLen = entries.reduce((s, p) => s + p.length, 0);
-      let pick = Math.random() * totalLen;
-      let chosen = entries[0];
-      for (const p of entries) {
-          pick -= p.length;
-          if (pick <= 0) { chosen = p; break; }
+  function rebuildVisibleRoadSpawnLocations() {
+      visibleRoadSpawnLocations = [];
+      const sampleSpacing = 20;
+      for (const path of roadPaths.values()) {
+          if (path.length < 40) continue;
+          for (let distance = 0; distance < path.length; distance += sampleSpacing) {
+              const position = samplePathPosition(path, distance, 1, 0);
+              if (!isInVisibleMapArea(position.pos, 3)) continue;
+              visibleRoadSpawnLocations.push({ path, distance });
+          }
       }
+  }
+
+  function chooseRoadSpawnLocation() {
+      if (!visibleRoadSpawnLocations.length) return null;
+      return visibleRoadSpawnLocations[Math.floor(Math.random() * visibleRoadSpawnLocations.length)];
+  }
+
+  function transferCarToOpenRoad(car, fromPosition) {
+      let alternate = null;
+      let nearestDistance = Infinity;
+      for (const location of visibleRoadSpawnLocations) {
+          const position = samplePathPosition(location.path, location.distance, 1, 0).pos;
+          const distance = haversineMeters(fromPosition[0], fromPosition[1], position[0], position[1]);
+          if (distance < nearestDistance) {
+              nearestDistance = distance;
+              alternate = location;
+          }
+      }
+      if (!alternate) return false;
+      car.pathId = alternate.path.id;
+      car.returnPath = null;
+      car.returnTarget = null;
+      car.t = alternate.distance;
+      car.direction = Math.random() < 0.5 ? 1 : -1;
+      car.laneOffset = -car.direction * 1.8;
+      const position = samplePathPosition(alternate.path, car.t, car.direction, car.laneOffset);
+      car.pos = position.pos;
+      car.heading = position.heading;
+      return true;
+  }
+
+  function rerouteCarsOnUnavailablePaths(previousPathsById = new Map()) {
+      for (const car of trafficCars) {
+          if (roadPaths.has(car.pathId) && !car.returnPath) continue;
+          if (!car.returnPath) {
+              const oldPath = previousPathsById.get(car.pathId);
+              if (!oldPath) continue;
+              car.returnPath = oldPath;
+              car.returnTarget = car.t <= oldPath.length / 2 ? 0 : oldPath.length;
+              car.direction = car.returnTarget === 0 ? -1 : 1;
+              car.laneOffset = -car.direction * 1.8;
+          }
+          const atEndpoint = car.returnTarget === 0 ? car.t <= 0.5 : car.t >= car.returnPath.length - 0.5;
+          if (atEndpoint) {
+              const endpoint = samplePathPosition(car.returnPath, car.returnTarget, car.direction, 0).pos;
+              transferCarToOpenRoad(car, endpoint);
+          } else {
+              const position = samplePathPosition(car.returnPath, car.t, car.direction, car.laneOffset);
+              car.pos = position.pos;
+              car.heading = position.heading;
+          }
+      }
+      const count = document.getElementById('traffic-count');
+      if (count) count.textContent = String(trafficCars.length);
+      updateTrafficLayer();
+  }
+
+  function spawnCar() {
+      const spawnLocation = chooseRoadSpawnLocation();
+      const chosen = spawnLocation?.path;
+      if (!chosen) return null;
       const direction = Math.random() < 0.5 ? 1 : -1;
       const speedRanges = {
           motorway: [18, 26], trunk: [14, 21], primary: [11, 17],
           secondary: [9, 14], tertiary: [7, 12]
       };
       const [minSpeed, maxSpeed] = speedRanges[chosen.cls] || [5, 10];
+      const laneOffset = -direction * 1.8;
+      const t = spawnLocation.distance;
+      const position = samplePathPosition(chosen, t, direction, laneOffset);
       return {
           id: `car-${++carIdCounter}`,
           pathId: chosen.id,
-          t: Math.random() * chosen.length,
+          t,
           speed: minSpeed + Math.random() * (maxSpeed - minSpeed),
           direction,
-          laneOffset: -direction * 1.8,
+          laneOffset,
           color: randomCarColor(),
-          pos: [0, 0, 0],
-          heading: 0
+          pos: position.pos,
+          heading: position.heading,
+          returnPath: null,
+          returnTarget: null
       };
   }
 
@@ -446,10 +807,16 @@ import { createTerrainController } from './src/terrain-survey.js';
           if (!c) break;
           trafficCars.push(c);
       }
-      while (trafficCars.length > target) trafficCars.pop();
+      while (trafficCars.length > target) {
+          const removableIndex = trafficCars.findLastIndex(car => !car.returnPath);
+          if (removableIndex === -1) break;
+          trafficCars.splice(removableIndex, 1);
+      }
       const el = document.getElementById('traffic-count');
       if (el) el.textContent = String(trafficCars.length);
       updateTrafficLayer();
+      refreshClosedRoadOverlay();
+      positionClosedRoadLayers();
   }
 
   function updateTrafficDemand() {
@@ -477,10 +844,20 @@ import { createTerrainController } from './src/terrain-survey.js';
       trafficLastT = now;
       const carsByLane = new Map();
       for (const car of trafficCars) {
-          const path = roadPaths.get(car.pathId);
+          const path = roadPaths.get(car.pathId) || car.returnPath;
           if (!path) continue;
           car.t += car.speed * car.direction * dt;
-          if (car.t < 0) {
+          if (car.returnPath) {
+              const reachedEndpoint = car.returnTarget === 0
+                  ? car.t <= 0
+                  : car.t >= path.length;
+              car.t = Math.max(0, Math.min(path.length, car.t));
+              if (reachedEndpoint) {
+                  const endpoint = samplePathPosition(path, car.returnTarget, car.direction, 0).pos;
+                  if (!transferCarToOpenRoad(car, endpoint)) car.t = car.returnTarget;
+                  continue;
+              }
+          } else if (car.t < 0) {
               car.t = -car.t;
               car.direction = 1;
               car.laneOffset *= -1;
@@ -507,7 +884,7 @@ import { createTerrainController } from './src/terrain-survey.js';
           }
       }
       for (const car of trafficCars) {
-          const path = roadPaths.get(car.pathId);
+          const path = roadPaths.get(car.pathId) || car.returnPath;
           if (!path) continue;
           const s = samplePathPosition(path, car.t, car.direction, car.laneOffset);
           car.pos = s.pos;
@@ -543,8 +920,34 @@ import { createTerrainController } from './src/terrain-survey.js';
       src.setData({ type: 'FeatureCollection', features });
   }
 
+  function isCarOnClosedRoad(car) {
+      if (!closedRoadSegments.size) return false;
+      const [lon, lat] = car.pos;
+      const metersPerLongitude = 111320 * Math.cos(lat * Math.PI / 180);
+      for (const road of closedRoadSegments.values()) {
+          for (let i = 1; i < road.coords.length; i++) {
+              const start = road.coords[i - 1];
+              const end = road.coords[i];
+              const dx = (end[0] - start[0]) * metersPerLongitude;
+              const dy = (end[1] - start[1]) * 111320;
+              const lengthSquared = dx * dx + dy * dy;
+              const carX = (lon - start[0]) * metersPerLongitude;
+              const carY = (lat - start[1]) * 111320;
+              const fraction = lengthSquared
+                  ? Math.max(0, Math.min(1, (carX * dx + carY * dy) / lengthSquared))
+                  : 0;
+              if (Math.hypot(carX - fraction * dx, carY - fraction * dy) <= 3.5) return true;
+          }
+      }
+      return false;
+  }
+
   function setupTrafficOverlay() {
-      if (map.getSource('traffic-cars-src')) return;
+      ensureClosedRoadOverlay();
+      if (map.getSource('traffic-cars-src')) {
+          positionClosedRoadLayers();
+          return;
+      }
       map.addSource('traffic-cars-src', {
           type: 'geojson',
           data: { type: 'FeatureCollection', features: [] }
@@ -573,6 +976,7 @@ import { createTerrainController } from './src/terrain-survey.js';
               'fill-extrusion-opacity': 1
           }
       });
+      positionClosedRoadLayers();
       dbg('Traffic: car layers created.');
   }
 
@@ -760,6 +1164,7 @@ import { createTerrainController } from './src/terrain-survey.js';
           if (!key || seen.has(key)) continue;
           seen.add(key);
           const center = geometryCenter(f.geometry);
+          if (!isInVisibleMapArea(center)) continue;
           const height = (f.properties && f.properties.render_height) || 12;
           const base = (f.properties && f.properties.render_min_height) || 0;
           const osmId = (f.properties && (f.properties.osm_id || f.properties.id)) || null;
@@ -790,8 +1195,9 @@ import { createTerrainController } from './src/terrain-survey.js';
           if (animatingBuildingIds.has(b.id)) continue;
           const key = `custom_${b.id}`;
           if (hiddenBuildingKeys.has(key)) continue;
-          const feature = customBuildingFeature(b);
           const center = centerOfCoordinates(b.coords);
+          if (!isInVisibleMapArea(center)) continue;
+          const feature = customBuildingFeature(b);
           if (highlightedBuildings.has(key)) {
               const h = highlightedBuildings.get(key);
               h.feature = feature;
@@ -1257,14 +1663,10 @@ import { createTerrainController } from './src/terrain-survey.js';
   function focusHeightInput() {
       buildingLifecycle.focusHeightInput();
   }
-  function readHeightInput() {
-      return buildingLifecycle.readHeightInput();
-  }
-
-  function commitPendingBuilding(height) {
-      const id = `custom-${++buildingIdCounter}`;
-      console.warn('Deprecated commitPendingBuilding path; controller handles commit.', { id, height });
-      buildingLifecycle.commitPendingBuilding();
+  function commitPendingBuilding() {
+      const committed = buildingLifecycle.commitPendingBuilding();
+      updateBuildingBuildButton();
+      return committed;
   }
   function cancelPendingBuilding() {
       buildingLifecycle.cancelPendingBuilding();
@@ -1607,6 +2009,7 @@ import { createTerrainController } from './src/terrain-survey.js';
       logPrompt('info', '• save buildings / load buildings');
       logPrompt('info', '• draw road / finish road / cancel road / undo point');
       logPrompt('info', '• delete road / stop deleting / list roads / clear roads');
+      logPrompt('info', '• close road / open road / stop closing');
       logPrompt('info', '• road color <c> / road width <m>');
       logPrompt('info', '• zone <lat>,<lon> <radius>m <Flood|Green|Shade>');
       logPrompt('info', '• draw zone / cancel zone / delete zone / list zones / clear all zones');
@@ -1648,8 +2051,13 @@ import { createTerrainController } from './src/terrain-survey.js';
       clearDeleteHover();
       refreshDrawnRoads();
       setDraftData();
-      roadDrawColor = '#ff0000';
+      roadClosureMode = null;
+      closedRoadSegments.clear();
+      refreshClosedRoadOverlay();
+      updateRoadClosureButtons();
+      roadDrawColor = '#16a34a';
       roadDrawWidth = 6;
+      if (map.isStyleLoaded()) extractRoadPathsFromTiles();
 
       if (pendingBuilding) cancelPendingBuilding();
       if (buildingDrawActive) cancelBuilding();
@@ -1671,10 +2079,13 @@ import { createTerrainController } from './src/terrain-survey.js';
     if (state.buildingLabels) updateBuildingLabels();
     updateBuildingLabelsToggle();
     terrainController.updateVisibility();
-      applyRoads(); applyBuildings(); applyLabels();
+      applyRoads();
+      mapShadesController.apply();
+      applyBuildings(); applyLabels();
       applyAmbientOcclusion();
-      overlayEl.style.opacity = state.hazeForce;
-      map.easeTo({ center: CENTER, zoom: 18, pitch: 60, bearing: 0, duration: 800 });
+    weather.resetCache();
+    weather.update();
+    map.easeTo({ center: CENTER, zoom: 18, pitch: 60, bearing: 0, duration: 800 });
       setTimeout(() => { refreshBuildings(); if (state.buildingLabels) updateBuildingLabels(); }, 1200);
       logPrompt('bot', 'Reset to defaults.');
   }
@@ -1799,6 +2210,12 @@ import { createTerrainController } from './src/terrain-survey.js';
       { re: /^undo\s+point$/i, run: () => undoDraftPoint() },
       { re: /^(?:delete|erase)\s+roads?$/i, run: () => startRoadDeleting() },
       { re: /^(?:stop|end|exit|done)\s+deleting$/i, run: () => { setRoadDeleteActive(false); logPrompt('bot', 'Road deletion OFF.'); } },
+      { re: /^(?:close|block)\s+roads?$/i, run: () => setRoadClosureMode('close') },
+      { re: /^(?:open|reopen|unblock)\s+roads?$/i, run: () => setRoadClosureMode('open') },
+      { re: /^(?:stop|end|exit|done)\s+(?:closing|opening)\s+roads?$/i, run: () => {
+          if (roadClosureMode) setRoadClosureMode(roadClosureMode);
+          else logPrompt('info', 'Road closure tool is already OFF.');
+      } },
       { re: /^(?:clear|remove|delete)\s+(?:all\s+)?(?:drawn\s+)?roads?$/i, run: () => clearAllRoads() },
       { re: /^list\s+(?:drawn\s+)?roads$/i, run: () => listRoads() },
       { re: /^road\s+(?:color|colour)\s+(.+)$/i, run: m => setRoadColor(m[1]) },
@@ -1992,6 +2409,8 @@ import { createTerrainController } from './src/terrain-survey.js';
     });
   document.getElementById('road-draw-btn').addEventListener('click', () => { if (roadDrawActive) finishRoad(); else startRoadDrawing(); });
   document.getElementById('road-delete-btn').addEventListener('click', () => startRoadDeleting());
+  document.getElementById('road-close-btn').addEventListener('click', () => setRoadClosureMode('close'));
+  document.getElementById('road-open-btn').addEventListener('click', () => setRoadClosureMode('open'));
   document.getElementById('building-build-btn').addEventListener('click', () => {
       if (pendingBuilding) { focusHeightInput(); return; }
       if (buildingDrawActive) finishBuilding();
@@ -2019,10 +2438,10 @@ import { createTerrainController } from './src/terrain-survey.js';
   });
   document.getElementById('zone-class-cancel').addEventListener('click', () => cancelPendingZone());
 
-  document.getElementById('height-ok').addEventListener('click', () => commitPendingBuilding(readHeightInput()));
+  document.getElementById('height-ok').addEventListener('click', () => commitPendingBuilding());
   document.getElementById('height-cancel').addEventListener('click', () => cancelPendingBuilding());
   document.getElementById('height-input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); commitPendingBuilding(readHeightInput()); }
+      if (e.key === 'Enter') { e.preventDefault(); commitPendingBuilding(); }
       else if (e.key === 'Escape') { e.preventDefault(); cancelPendingBuilding(); }
   });
 
@@ -2037,7 +2456,7 @@ import { createTerrainController } from './src/terrain-survey.js';
       }
       if (pendingBuilding) {
           if (e.key === 'Escape') { e.preventDefault(); cancelPendingBuilding(); }
-          else if (e.key === 'Enter') { e.preventDefault(); commitPendingBuilding(readHeightInput()); }
+          else if (e.key === 'Enter') { e.preventDefault(); commitPendingBuilding(); }
           return;
       }
       if (zoneDrawActive) { if (e.key === 'Escape') { e.preventDefault(); cancelZone(); } return; }
@@ -2071,6 +2490,7 @@ import { createTerrainController } from './src/terrain-survey.js';
           return;
       }
       if (roadDeleteActive && e.key === 'Escape') { e.preventDefault(); setRoadDeleteActive(false); }
+      if (roadClosureMode && e.key === 'Escape') { e.preventDefault(); setRoadClosureMode(roadClosureMode); }
   });
 
   map.on('mousedown', (e) => { if (buildingEditActive) tryStartBuildingDrag(e); });
@@ -2149,6 +2569,8 @@ import { createTerrainController } from './src/terrain-survey.js';
           }
           return;
       }
+      if (roadClosureMode === 'close') { closeRoadAtPoint(e.point); return; }
+      if (roadClosureMode === 'open') { openRoadAtPoint(e.point); return; }
       if (!tilePickerActive) return;
       toggleTileAt(e.lngLat.lng, e.lngLat.lat);
   });
@@ -2199,6 +2621,14 @@ import { createTerrainController } from './src/terrain-survey.js';
           else { clearDeleteHover(); map.getCanvas().style.cursor = 'crosshair'; }
           return;
       }
+      if (roadClosureMode === 'close') {
+          map.getCanvas().style.cursor = findBaseRoadFeatureAtPoint(e.point) ? 'pointer' : 'crosshair';
+          return;
+      }
+      if (roadClosureMode === 'open') {
+          map.getCanvas().style.cursor = findClosedRoadAtPoint(e.point) ? 'pointer' : 'crosshair';
+          return;
+      }
       if (!tilePickerActive) return;
       updateTileHover(e.lngLat.lng, e.lngLat.lat);
   });
@@ -2217,6 +2647,7 @@ import { createTerrainController } from './src/terrain-survey.js';
       clearBuildingDeleteHover();
       clearZoneDeleteHover();
       if (buildingInteraction.getBuildingDragState()) endBuildingDrag();
+      if (roadClosureMode) map.getCanvas().style.cursor = 'crosshair';
   });
 
   const parkController = createParkController({ map, center: CENTER, dbg });
@@ -2272,17 +2703,14 @@ import { createTerrainController } from './src/terrain-survey.js';
           schedulePositionRoadLayers();
           scheduleBringBuildingEditorToTop();
           scheduleBringZoneTopLayersToTop();
+          schedulePositionClosedRoadLayers();
       });
-
-      if (state.hazeMode === 'force') {
-          overlayEl.style.opacity = state.hazeForce;
-          dbg(`Haze forced to ${Math.round(state.hazeForce * 100)}%.`);
-      }
 
       applyAmbientOcclusion();
 
       // Traffic setup
       setupTrafficOverlay();
+      mapShadesController.apply();
     setInterval(updateTrafficDemand, 30000);
 
       setTimeout(() => {
@@ -2305,7 +2733,7 @@ import { createTerrainController } from './src/terrain-survey.js';
       }, 1500);
 
       setTimeout(() => reportTileStats(true), 1500);
-      logPrompt('info', 'Ready. Haze = 20%, cast shadows ON, traffic available.');
+      logPrompt('info', 'Ready. Haze follows live visibility, cast shadows ON, traffic available.');
     logPrompt('info', 'Traffic count follows the estimated Sulaimani time-of-day profile. Type "traffic status" for details.');
       logPrompt('info', 'Type "help" for the full command list.');
   });

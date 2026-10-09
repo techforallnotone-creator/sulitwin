@@ -19,7 +19,7 @@ export function createRoadLayerController({ map, dbg }) {
         id: 'drawn-roads', type: 'line', source: 'drawn-roads-src',
         layout: { 'line-cap': 'round', 'line-join': 'round' },
         paint: {
-          'line-color': '#ff0000',
+          'line-color': ['coalesce', ['get', 'color'], '#16a34a'],
           'line-width': ['interpolate', ['exponential', 2], ['zoom'], 15, ['*', ['coalesce', ['get', 'width'], 6], 0.257], 20, ['*', ['coalesce', ['get', 'width'], 6], 8.23]],
           'line-opacity': 1
         }
@@ -43,7 +43,7 @@ export function createRoadLayerController({ map, dbg }) {
       map.addLayer({
         id: 'road-draft-line', type: 'line', source: 'road-draft-src',
         layout: { 'line-cap': 'round', 'line-join': 'round' },
-        paint: { 'line-color': '#ff0000', 'line-width': 4, 'line-dasharray': [2, 1.5], 'line-opacity': 0.9 }
+        paint: { 'line-color': '#16a34a', 'line-width': 4, 'line-dasharray': [2, 1.5], 'line-opacity': 0.9 }
       });
     }
     if (!map.getLayer('road-draft-points')) {
@@ -52,7 +52,7 @@ export function createRoadLayerController({ map, dbg }) {
         paint: {
           'circle-radius': 6,
           'circle-color': '#ffffff',
-          'circle-stroke-color': '#ff0000',
+          'circle-stroke-color': '#16a34a',
           'circle-stroke-width': 2
         }
       });
@@ -65,22 +65,30 @@ export function createRoadLayerController({ map, dbg }) {
 
   function roadLayersArePositioned() {
     let layers;
-    try { layers = map.getStyle().layers; } catch (e) { return true; }
-    if (!layers || !layers.length) return true;
+    try { layers = map.getStyle().layers; } catch (e) { return false; }
+    if (!layers || !layers.length) return false;
     const idxBL = layers.findIndex(l => l.id === 'buildings-live');
-    if (idxBL < 0) return true;
-    const idxDR = layers.findIndex(l => l.id === 'drawn-roads');
-    if (idxDR < 0) return true;
-    const idxDP = layers.findIndex(l => l.id === 'road-draft-points');
-    return idxDR < idxBL && (idxDP < 0 || idxDP < idxBL);
+    const roadLayerIds = ROAD_LAYER_IDS.filter(id => map.getLayer(id));
+    if (!roadLayerIds.length) return true;
+
+    if (idxBL < 0) {
+      return roadLayerIds.every((id, i) => layers[layers.length - roadLayerIds.length + i]?.id === id);
+    }
+
+    const anchor = layers.slice(idxBL + 1).find(layer => !ROAD_LAYER_IDS.includes(layer.id));
+    const anchorIndex = anchor ? layers.findIndex(layer => layer.id === anchor.id) : layers.length;
+    return roadLayerIds.every((id, i) => layers[anchorIndex - roadLayerIds.length + i]?.id === id);
   }
 
   function positionRoadLayers() {
-    if (!map.getLayer('buildings-live')) return;
     if (roadLayersArePositioned()) return;
-    const before = 'buildings-live';
+    const layers = map.getStyle().layers || [];
+    const idxBL = layers.findIndex(layer => layer.id === 'buildings-live');
+    const anchor = idxBL < 0
+      ? null
+      : layers.slice(idxBL + 1).find(layer => !ROAD_LAYER_IDS.includes(layer.id));
     for (const id of ROAD_LAYER_IDS) {
-      if (map.getLayer(id)) map.moveLayer(id, before);
+      if (map.getLayer(id)) map.moveLayer(id, anchor?.id);
     }
   }
 
@@ -234,7 +242,7 @@ export function createRoadLifecycleController({
     const id = `road-${nextIdNumber}`;
     const n = getDraftCoords().length;
     const roads = getDrawnRoads();
-    roads.set(id, { id, coords: getDraftCoords().slice(), color: '#ff0000', width: getRoadDrawWidth() });
+    roads.set(id, { id, coords: getDraftCoords().slice(), color: getRoadDrawColor(), width: getRoadDrawWidth() });
     setDrawnRoads(roads);
     setDraftCoords([]);
     setDraftCursor(null);

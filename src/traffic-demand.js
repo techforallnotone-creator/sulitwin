@@ -1,5 +1,5 @@
 const TIME_ZONE = 'Asia/Baghdad';
-const MAX_VISIBLE_CARS = 10000;
+const MAX_VISIBLE_CARS = 5000;
 
 const DAY_FACTORS = [1, 1, 1, 1.02, 1.05, 0.55, 0.8];
 const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];

@@ -16,6 +16,9 @@ export function createBuildingEditorController({ map, dbg }) {
     if (!map.getLayer('building-draft-points')) map.addLayer({ id: 'building-draft-points', type: 'circle', source: 'building-draft-points-src', paint: { 'circle-radius': 6, 'circle-color': '#ffffff', 'circle-stroke-color': '#7c3aed', 'circle-stroke-width': 2 } });
     if (!map.getLayer('building-selected')) map.addLayer({ id: 'building-selected', type: 'line', source: 'building-selected-src', layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#0ea5e9', 'line-width': 3, 'line-opacity': 1 } });
     if (!map.getLayer('building-vertices')) map.addLayer({ id: 'building-vertices', type: 'circle', source: 'building-vertices-src', paint: { 'circle-radius': 7, 'circle-color': '#ffffff', 'circle-stroke-color': '#0284c7', 'circle-stroke-width': 2.5 } });
+    for (const id of ['building-draft-fill', 'building-draft-line', 'building-draft-points']) {
+      map.setLayoutProperty(id, 'visibility', 'none');
+    }
     bringBuildingEditorToTop();
   }
 
@@ -276,6 +279,10 @@ export function createBuildingLifecycleController({
   animateNewBuilding
 }) {
   function setBuildingDraftData() {
+    const visibility = getBuildingDrawActive() ? 'visible' : 'none';
+    for (const id of ['building-draft-fill', 'building-draft-line', 'building-draft-points']) {
+      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', visibility);
+    }
     const fillSrc = map.getSource('building-draft-fill-src');
     if (fillSrc) {
       const closed = getBuildingDraftCoords().length >= 3 ? [[...getBuildingDraftCoords(), getBuildingDraftCoords()[0]]] : [];
@@ -359,12 +366,14 @@ export function createBuildingLifecycleController({
     setBuildingDraftCursor(null);
     hideHeightPanel();
     setBuildingDrawActive(false);
+    setBuildingDraftData();
+    if (typeof updateBuildingBuildButton === 'function') updateBuildingBuildButton();
     refreshBuildings();
     if (state.buildingLabels) updateBuildingLabels();
     saveCustomBuildings();
     setBuildingDefaultHeight(height);
     logPrompt('bot', `Added building ${id} (${n} vertices, ${height} m).`);
-    setSelectedBuildingId(id);
+    setSelectedBuildingId(null);
     updateSelectionOverlay();
     if (typeof updateBuildingEditButton === 'function') updateBuildingEditButton();
     return true;
@@ -377,6 +386,8 @@ export function createBuildingLifecycleController({
     setBuildingDraftCursor(null);
     hideHeightPanel();
     setBuildingDrawActive(false);
+    setBuildingDraftData();
+    if (typeof updateBuildingBuildButton === 'function') updateBuildingBuildButton();
     logPrompt('bot', 'Building creation cancelled.');
     return true;
   }
