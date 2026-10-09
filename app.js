@@ -1381,7 +1381,7 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
           car.pos = s.pos;
           car.heading = s.heading;
       }
-      updateTrafficLayer();
+      if (!map.isMoving()) updateTrafficLayer();
       trafficRafId = requestAnimationFrame(animateTraffic);
   }
 
@@ -1409,6 +1409,7 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
       }
       src.setData({ type: 'FeatureCollection', features });
   }
+  map.on('moveend', updateTrafficLayer);
 
   function setupTrafficOverlay() {
       ensureClosedRoadOverlay();

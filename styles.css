@@ -389,3 +389,158 @@ html, body { margin: 0; padding: 0; height: 100%; }
           font: inherit; font-weight: 600; cursor: pointer;
       }
       .zone-class-actions button:hover { background: rgba(255,255,255,0.1); }
+
+      @media (max-width: 600px) {
+          #info, #status { display: none; }
+
+          #weather {
+              top: max(10px, env(safe-area-inset-top)) !important;
+              left: 10px; right: auto !important;
+              display: flex; align-items: center; gap: 8px;
+              width: auto; min-width: 0 !important;
+              padding: 7px 10px !important;
+              border: 1px solid rgba(30, 41, 59, .16);
+              border-radius: 10px !important;
+              box-shadow: 0 3px 12px rgba(0, 0, 0, .22) !important;
+          }
+          #map-clock, #weather > div[style*="text-transform:uppercase"],
+          #weather-desc, #weather-extra, #traffic-panel { display: none !important; }
+          #weather-body { gap: 6px !important; }
+          #weather-icon { font-size: 21px !important; }
+          #weather-temp { font-size: 14px !important; }
+
+          #prompt-container {
+              top: auto; bottom: max(10px, env(safe-area-inset-bottom));
+              left: 10px; transform: none;
+              width: calc(100% - 20px); gap: 5px;
+              font-size: 14px;
+          }
+          #prompt-bar {
+              min-width: 0; gap: 4px; padding: 5px;
+              border: 1px solid rgba(148, 163, 184, .24);
+              border-radius: 12px;
+              background: rgba(9, 15, 27, .96);
+              box-shadow: 0 4px 18px rgba(0, 0, 0, .42);
+          }
+          #prompt-input {
+              min-width: 0; padding: 9px 7px;
+              font-size: 16px;
+          }
+          #prompt-history-toggle { display: none; }
+          #gemini-key-toggle, #prompt-send {
+              min-height: 42px; padding: 7px 10px;
+              border-radius: 8px; font-size: 13px;
+          }
+          #prompt-send { padding-inline: 13px; }
+          #prompt-log {
+              max-height: 28vh; border-radius: 10px;
+              background: rgba(9, 15, 27, .97);
+          }
+          #gemini-key-panel { border-radius: 10px; }
+          .gemini-key-row { flex-wrap: wrap; }
+          #gemini-api-key { min-height: 40px; flex-basis: 100%; font-size: 16px; }
+          #gemini-key-save, #gemini-key-clear { min-height: 40px; }
+
+          #tools-drawer {
+              position: fixed; top: auto; right: 10px;
+              bottom: calc(152px + env(safe-area-inset-bottom));
+              z-index: 6; transform: none;
+              transition: transform .2s ease, opacity .2s ease;
+          }
+          #tools-drawer.collapsed {
+              transform: translateY(calc(100% + 150px));
+              pointer-events: none; opacity: 0;
+          }
+          #map-tools {
+              display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+              gap: 7px; width: calc(100vw - 20px);
+              max-height: min(44vh, 420px); box-sizing: border-box;
+              overflow-y: auto; overscroll-behavior: contain;
+              padding: 10px;
+              border: 1px solid rgba(148, 163, 184, .32);
+              border-radius: 14px;
+              background: rgba(15, 23, 42, .97);
+              box-shadow: 0 8px 26px rgba(0, 0, 0, .45);
+          }
+          #map-tools button {
+              min-width: 0; min-height: 44px; padding: 8px 9px;
+              border: 1px solid rgba(148, 163, 184, .28);
+              border-radius: 9px;
+              background: rgba(255, 255, 255, .95);
+              font-size: 12px; line-height: 1.2;
+              white-space: normal; text-align: center;
+              touch-action: manipulation;
+          }
+          #tools-drawer-toggle {
+              position: fixed; top: auto; right: 12px;
+              bottom: calc(76px + env(safe-area-inset-bottom));
+              width: 48px; height: 48px;
+              border: 1px solid rgba(255, 255, 255, .3);
+              border-radius: 15px;
+              background: #0f172a; color: #fff;
+              font-size: 24px;
+              box-shadow: 0 4px 16px rgba(0, 0, 0, .42);
+              touch-action: manipulation;
+          }
+
+          .maplibregl-ctrl-top-right {
+              top: max(10px, env(safe-area-inset-top));
+              right: 10px;
+          }
+          .maplibregl-ctrl-bottom-right {
+              top: calc(54px + env(safe-area-inset-top));
+              bottom: auto;
+              left: auto;
+              right: 10px;
+              width: auto;
+          }
+          .maplibregl-ctrl-attrib { max-width: calc(100vw - 20px); }
+          #height-panel, #zone-class-panel {
+              width: calc(100vw - 32px); min-width: 0;
+              max-width: 420px; box-sizing: border-box;
+              border-radius: 14px;
+          }
+          .height-panel-actions button, .zone-class-actions button {
+              min-height: 42px;
+          }
+          .zone-class-btn { min-height: 48px; padding: 8px 6px; }
+      }
+
+      @media (max-width: 360px) {
+          #gemini-key-toggle { padding-inline: 8px; }
+          #prompt-send { padding-inline: 10px; }
+      }
+
+      @media (max-height: 520px) and (max-width: 900px) {
+          #info, #status { display: none; }
+          #weather {
+              top: max(8px, env(safe-area-inset-top)) !important;
+              left: 10px; right: auto !important;
+              display: flex; align-items: center; gap: 8px;
+              width: auto; min-width: 0 !important;
+              padding: 6px 9px !important;
+              border-radius: 9px !important;
+          }
+          #map-clock, #weather > div[style*="text-transform:uppercase"],
+          #weather-desc, #weather-extra, #traffic-panel { display: none !important; }
+          #weather-body { gap: 6px !important; }
+          #weather-icon { font-size: 20px !important; }
+          #weather-temp { font-size: 14px !important; }
+          #prompt-container {
+              top: auto; bottom: max(6px, env(safe-area-inset-bottom));
+              left: 10px; transform: none; width: calc(100% - 20px);
+          }
+          #prompt-log { max-height: 24vh; }
+          #tools-drawer {
+              top: 50%; bottom: auto;
+              transform: translateY(-50%);
+          }
+          #tools-drawer.collapsed { transform: translate(calc(100% + 44px), -50%); }
+          #map-tools { max-height: 42vh; }
+          #tools-drawer-toggle { top: 50%; bottom: auto; }
+          .maplibregl-ctrl-bottom-right {
+              top: calc(50px + env(safe-area-inset-top));
+              right: 10px; bottom: auto; left: auto; width: auto;
+          }
+          .maplibregl-ctrl-attrib { max-width: calc(100vw - 20px); }
+      }
