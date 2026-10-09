@@ -32,11 +32,13 @@ import { createBuildingConstructionController } from './src/building-constructio
 import { trafficDemandAt } from './src/traffic-demand.js';
 import { createZoneController } from './src/zones.js';
 import { createTerrainController } from './src/terrain-survey.js';
+import { createGeminiAssistant } from './src/gemini-assistant.js';
 
   const MAX_BUILDING_LABELS = 10000;
   const CUSTOM_BUILDINGS_STORAGE_KEY = 'maplibre-custom-buildings-v1';
 
   const state = { ...DEFAULTS };
+  const geminiAssistant = createGeminiAssistant();
 
   const statusEl = document.getElementById('status');
   const statusBodyEl = document.getElementById('status-body');
@@ -126,6 +128,7 @@ import { createTerrainController } from './src/terrain-survey.js';
   let hoveredDeleteRoadId = null;
 
   const customBuildings = new Map();
+  const buildingInsightMarkers = new Map();
   const animatingBuildingIds = new Set();
   let buildingDragState = null;
   const buildingConstruction = createBuildingConstructionController({
@@ -196,7 +199,7 @@ import { createTerrainController } from './src/terrain-survey.js';
       stopBuildingEdit,
     updateBuildingDraftData: setBuildingDraftData,
     animateNewBuilding: (building) => {
-        if (isBuildingInVisibleMapArea(centerOfCoordinates(building.coords))) {
+          if (isInVisibleMapArea(centerOfCoordinates(building.coords))) {
             buildingConstruction.start(building);
         }
     }
@@ -267,6 +270,8 @@ import { createTerrainController } from './src/terrain-survey.js';
   const roadPathKeys = new Map();
   let visibleRoadSpawnLocations = [];
   const closedRoadSegments = new Map();
+  const closedRoadMarkers = new Map();
+  const rerouteGuidance = new Map();
   let carIdCounter = 0;
   const trafficCars = [];
   const TRAFFIC_MIN_GAP_METERS = 5.5;
@@ -318,21 +323,232 @@ import { createTerrainController } from './src/terrain-survey.js';
       return coords[coords.length - 1].slice(0, 2);
   }
 
+  let rerouteAnimationTimer = null;
+
+  function refreshRerouteArrows() {
+      const arrowsSource = map.getSource('reroute-arrows-src');
+      if (!arrowsSource) return;
+      const arrowFeatures = [];
+      const now = Date.now();
+      for (const guidance of rerouteGuidance.values()) {
+          guidance.alternatives.forEach((path, index) => {
+              const position = samplePathPosition(path, now * 0.012 + index * path.length / guidance.alternatives.length, 1, 0);
+              arrowFeatures.push({
+                  type: 'Feature',
+                  properties: { heading: position.heading },
+                  geometry: { type: 'Point', coordinates: position.pos.slice(0, 2) }
+              });
+          });
+      }
+      arrowsSource.setData({ type: 'FeatureCollection', features: arrowFeatures });
+  }
+
+  function refreshRerouteOverlay() {
+      const pathsSource = map.getSource('reroute-paths-src');
+      if (!pathsSource) return;
+      const pathFeatures = [];
+      for (const [key, guidance] of rerouteGuidance) {
+          guidance.alternatives.forEach((path, index) => pathFeatures.push({
+              type: 'Feature',
+              properties: { key, index },
+              geometry: { type: 'LineString', coordinates: path.coords }
+          }));
+      }
+      pathsSource.setData({ type: 'FeatureCollection', features: pathFeatures });
+      refreshRerouteArrows();
+      map.triggerRepaint();
+      if (rerouteGuidance.size && !rerouteAnimationTimer) {
+          rerouteAnimationTimer = setInterval(refreshRerouteArrows, 80);
+      } else if (!rerouteGuidance.size && rerouteAnimationTimer) {
+          clearInterval(rerouteAnimationTimer);
+          rerouteAnimationTimer = null;
+      }
+  }
+
+  function findConnectedReroutePaths(road) {
+      const nodes = new Map();
+      const nodeKey = coord => `${coord[0].toFixed(5)},${coord[1].toFixed(5)}`;
+      const getNode = coord => {
+          const key = nodeKey(coord);
+          if (!nodes.has(key)) nodes.set(key, { key, coord: coord.slice(0, 2), edges: [] });
+          return nodes.get(key);
+      };
+      for (const path of roadPaths.values()) {
+          if (!path.coords || path.coords.length < 2) continue;
+          const start = getNode(path.coords[0]);
+          const end = getNode(path.coords[path.coords.length - 1]);
+          const edge = { id: path.id, path, start: start.key, end: end.key };
+          start.edges.push(edge);
+          end.edges.push(edge);
+      }
+      const nearestNode = coord => {
+          let nearest = null;
+          let distance = Infinity;
+          for (const node of nodes.values()) {
+              const nextDistance = haversineMeters(coord[0], coord[1], node.coord[0], node.coord[1]);
+              if (nextDistance < distance) {
+                  nearest = node;
+                  distance = nextDistance;
+              }
+          }
+          return distance <= 75 ? { node: nearest, distance } : null;
+      };
+      const start = nearestNode(road.coords[0]);
+      const end = nearestNode(road.coords[road.coords.length - 1]);
+      if (!start || !end || start.node.key === end.node.key) return [];
+
+      const shortestPath = blockedEdgeId => {
+          const distances = new Map([[start.node.key, 0]]);
+          const previous = new Map();
+          const visited = new Set();
+          while (visited.size < nodes.size) {
+              let current = null;
+              let currentDistance = Infinity;
+              for (const [key, distance] of distances) {
+                  if (!visited.has(key) && distance < currentDistance) {
+                      current = key;
+                      currentDistance = distance;
+                  }
+              }
+              if (current == null || current === end.node.key) break;
+              visited.add(current);
+              const node = nodes.get(current);
+              for (const edge of node.edges) {
+                  if (edge.id === blockedEdgeId) continue;
+                  const next = edge.start === current ? edge.end : edge.start;
+                  const distance = currentDistance + edge.path.length;
+                  if (distance < (distances.get(next) ?? Infinity)) {
+                      distances.set(next, distance);
+                      previous.set(next, { from: current, edge });
+                  }
+              }
+          }
+          if (!distances.has(end.node.key)) return null;
+          const edges = [];
+          let current = end.node.key;
+          while (current !== start.node.key) {
+              const step = previous.get(current);
+              if (!step) return null;
+              edges.unshift({ ...step.edge, from: step.from });
+              current = step.from;
+          }
+          return { edges, length: distances.get(end.node.key) + start.distance + end.distance };
+      };
+
+      const primary = shortestPath(null);
+      if (!primary) return [];
+      const routes = new Map();
+      const addRoute = route => {
+          const signature = route.edges.map(edge => edge.id).join('|');
+          if (routes.has(signature)) return;
+          const coords = [road.coords[0].slice(0, 2)];
+          for (const edge of route.edges) {
+              const pathCoords = edge.from === edge.start ? edge.path.coords : edge.path.coords.slice().reverse();
+              for (const coord of pathCoords) {
+                  const previous = coords[coords.length - 1];
+                  if (haversineMeters(previous[0], previous[1], coord[0], coord[1]) > 0.5) coords.push(coord.slice(0, 2));
+              }
+          }
+          const final = road.coords[road.coords.length - 1];
+          if (haversineMeters(coords.at(-1)[0], coords.at(-1)[1], final[0], final[1]) > 0.5) coords.push(final.slice(0, 2));
+          const routePath = preparePath(coords, 'reroute');
+          if (routePath.length > 0) routes.set(signature, { path: routePath, length: route.length });
+      };
+      addRoute(primary);
+      for (const edge of primary.edges) {
+          if (routes.size >= 3) break;
+          const alternate = shortestPath(edge.id);
+          if (alternate) addRoute(alternate);
+      }
+      return [...routes.values()].sort((a, b) => a.length - b.length).slice(0, 3);
+  }
+
+  function showTrafficReroute(road) {
+      const closedCoords = road.displayCoords || road.coords;
+      const center = midpointOfCoordinates(closedCoords);
+      const connectedRoutes = findConnectedReroutePaths({ ...road, coords: closedCoords });
+      const rankedPaths = connectedRoutes.length ? connectedRoutes : [...roadPaths.values()].map(path => {
+          let nearestDistance = Infinity;
+          for (const coord of path.coords) {
+              if (!isInVisibleMapArea(coord)) continue;
+              nearestDistance = Math.min(nearestDistance, haversineMeters(center[0], center[1], coord[0], coord[1]));
+          }
+          return { path, nearestDistance, length: path.length };
+      }).filter(item => Number.isFinite(item.nearestDistance))
+          .sort((a, b) => a.nearestDistance - b.nearestDistance)
+          .slice(0, 3);
+      const alternatives = rankedPaths.map(item => item.path);
+      const closedLength = closedCoords.slice(1).reduce((sum, coord, index) =>
+          sum + haversineMeters(closedCoords[index][0], closedCoords[index][1], coord[0], coord[1]), 0);
+      const nearestDistance = rankedPaths[0]?.nearestDistance ?? null;
+      const routeLength = rankedPaths[0]?.length;
+      const extraMeters = routeLength != null
+          ? Math.max(0, routeLength - closedLength)
+          : nearestDistance == null ? null : Math.max(0, nearestDistance * 2 + closedLength * 0.8 - closedLength);
+      const delayMinutes = extraMeters == null ? null : Math.max(1, Math.ceil(extraMeters / 416.7));
+      const element = document.createElement('section');
+      element.className = 'map-ai-panel map-reroute-panel';
+      const heading = document.createElement('strong');
+      heading.textContent = 'Road closure detour';
+      const details = document.createElement('div');
+      details.textContent = delayMinutes == null
+          ? 'No open alternative road was found nearby.'
+          : `Estimated added travel time: ~${delayMinutes} min\n${alternatives.length} ${connectedRoutes.length ? 'alternative route(s)' : 'nearby open road(s)'} highlighted`;
+      const note = document.createElement('div');
+      note.className = 'map-ai-note';
+      note.textContent = connectedRoutes.length
+          ? 'Route connectivity follows the map road network; estimate assumes an average 25 km/h.'
+          : 'Nearby open roads shown; network connectivity could not be confirmed.';
+      element.append(heading, details, note);
+      const marker = new maplibregl.Marker({ element, anchor: 'bottom', pitchAlignment: 'map' })
+          .setLngLat(center);
+      if (typeof marker.setAltitude === 'function') marker.setAltitude(4);
+      marker.addTo(map);
+      rerouteGuidance.get(road.key)?.marker.remove();
+      rerouteGuidance.set(road.key, { marker, alternatives, delayMinutes });
+      refreshRerouteOverlay();
+
+      if (geminiAssistant.hasApiKey() && delayMinutes != null) {
+          geminiAssistant.generateContent(
+              `In one short sentence explain this approximate road detour to a driver. Do not change the estimate. ` +
+              `The app found ${alternatives.length} nearby open road path(s); estimated added travel time is ${delayMinutes} minutes, ` +
+              `based on 25 km/h average speed and map geometry.`
+          ).then(result => {
+              note.textContent = result.text;
+          }).catch(error => {
+              note.textContent = 'Detour time is an approximate local calculation.';
+              logPrompt('error', `Road detour Gemini error: ${error.message}`);
+          });
+      }
+  }
+
+  function clearTrafficReroute(key) {
+      const guidance = rerouteGuidance.get(key);
+      if (!guidance) return;
+      guidance.marker.remove();
+      rerouteGuidance.delete(key);
+      refreshRerouteOverlay();
+  }
+
   function refreshClosedRoadOverlay() {
-      if (!map.isStyleLoaded()) {
+      syncClosedRoadMarkers();
+      const roads = map.getSource('closed-roads-src');
+      const signs = map.getSource('closed-road-signs-src');
+      if (!roads || !signs) {
+          if (map.getStyle()) {
+              ensureClosedRoadOverlay();
+              return;
+          }
           updateRoadClosureButtons();
           return;
       }
-      const roads = map.getSource('closed-roads-src');
-      const signs = map.getSource('closed-road-signs-src');
-      if (!roads || !signs) return;
       const closed = [...closedRoadSegments.values()];
       roads.setData({
           type: 'FeatureCollection',
           features: closed.map(road => ({
               type: 'Feature',
               properties: { key: road.key },
-              geometry: { type: 'LineString', coordinates: road.coords }
+              geometry: { type: 'LineString', coordinates: road.displayCoords || road.coords }
           }))
       });
       signs.setData({
@@ -340,11 +556,96 @@ import { createTerrainController } from './src/terrain-survey.js';
           features: closed.map(road => ({
               type: 'Feature',
               properties: { key: road.key, label: '×' },
-              geometry: { type: 'Point', coordinates: midpointOfCoordinates(road.coords) }
+              geometry: { type: 'Point', coordinates: midpointOfCoordinates(road.displayCoords || road.coords) }
           }))
       });
+      map.triggerRepaint();
       updateRoadClosureButtons();
   }
+
+  function createClosedRoadMarker(road) {
+      const element = document.createElement('div');
+      element.className = 'closed-road-immediate-marker';
+      element.setAttribute('aria-hidden', 'true');
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.style.cssText = 'position:absolute;overflow:visible;pointer-events:none';
+      const outline = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+      outline.setAttribute('fill', 'none');
+      outline.setAttribute('stroke', '#ffffff');
+      outline.setAttribute('stroke-width', '12');
+      outline.setAttribute('stroke-linecap', 'round');
+      outline.setAttribute('stroke-linejoin', 'round');
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+      line.setAttribute('fill', 'none');
+      line.setAttribute('stroke', '#dc2626');
+      line.setAttribute('stroke-width', '8');
+      line.setAttribute('stroke-linecap', 'round');
+      line.setAttribute('stroke-linejoin', 'round');
+      const sign = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      circle.setAttribute('r', '10');
+      circle.setAttribute('fill', '#dc2626');
+      circle.setAttribute('stroke', '#ffffff');
+      circle.setAttribute('stroke-width', '2');
+      const bar = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      bar.setAttribute('d', 'M -4 -4 L 4 4 M 4 -4 L -4 4');
+      bar.setAttribute('fill', 'none');
+      bar.setAttribute('stroke', '#ffffff');
+      bar.setAttribute('stroke-width', '2.5');
+      bar.setAttribute('stroke-linecap', 'round');
+      sign.append(circle, bar);
+      svg.append(outline, line, sign);
+      element.append(svg);
+      const marker = new maplibregl.Marker({
+          element,
+          anchor: 'center',
+          pitchAlignment: 'viewport',
+          rotationAlignment: 'viewport'
+      }).setLngLat(midpointOfCoordinates(road.displayCoords || road.coords)).addTo(map);
+      return { marker, svg, outline, line, sign };
+  }
+
+  function positionClosedRoadMarker(road, markerParts) {
+      const coords = road.displayCoords || road.coords;
+      const center = midpointOfCoordinates(coords);
+      markerParts.marker.setLngLat(center);
+      const projected = coords.map(coord => map.project(coord));
+      const centerPoint = map.project(center);
+      const minX = Math.min(...projected.map(point => point.x));
+      const minY = Math.min(...projected.map(point => point.y));
+      const maxX = Math.max(...projected.map(point => point.x));
+      const maxY = Math.max(...projected.map(point => point.y));
+      const width = Math.max(1, maxX - minX);
+      const height = Math.max(1, maxY - minY);
+      const svg = markerParts.svg;
+      svg.setAttribute('width', String(width));
+      svg.setAttribute('height', String(height));
+      svg.style.left = `${minX - centerPoint.x}px`;
+      svg.style.top = `${minY - centerPoint.y}px`;
+      const points = projected.map(point => `${point.x - minX},${point.y - minY}`).join(' ');
+      markerParts.outline.setAttribute('points', points);
+      markerParts.line.setAttribute('points', points);
+      const signX = centerPoint.x - minX;
+      const signY = centerPoint.y - minY;
+      markerParts.sign.setAttribute('transform', `translate(${signX} ${signY})`);
+  }
+
+  function syncClosedRoadMarkers() {
+      for (const [key, markerParts] of closedRoadMarkers) {
+          if (closedRoadSegments.has(key)) continue;
+          markerParts.marker.remove();
+          closedRoadMarkers.delete(key);
+      }
+      for (const [key, road] of closedRoadSegments) {
+          let markerParts = closedRoadMarkers.get(key);
+          if (!markerParts) {
+              markerParts = createClosedRoadMarker(road);
+              closedRoadMarkers.set(key, markerParts);
+          }
+          positionClosedRoadMarker(road, markerParts);
+      }
+  }
+  map.on('move', syncClosedRoadMarkers);
 
   function ensureClosedRoadOverlay() {
       if (!map.getSource('closed-roads-src')) {
@@ -355,6 +656,18 @@ import { createTerrainController } from './src/terrain-survey.js';
       }
       if (!map.getSource('closed-road-signs-src')) {
           map.addSource('closed-road-signs-src', {
+              type: 'geojson',
+              data: { type: 'FeatureCollection', features: [] }
+          });
+      }
+      if (!map.getSource('reroute-paths-src')) {
+          map.addSource('reroute-paths-src', {
+              type: 'geojson',
+              data: { type: 'FeatureCollection', features: [] }
+          });
+      }
+      if (!map.getSource('reroute-arrows-src')) {
+          map.addSource('reroute-arrows-src', {
               type: 'geojson',
               data: { type: 'FeatureCollection', features: [] }
           });
@@ -400,12 +713,39 @@ import { createTerrainController } from './src/terrain-survey.js';
               paint: { 'text-color': '#ffffff' }
           });
       }
+      if (!map.getLayer('reroute-paths-line')) {
+          map.addLayer({
+              id: 'reroute-paths-line',
+              type: 'line',
+              source: 'reroute-paths-src',
+              layout: { 'line-cap': 'round', 'line-join': 'round' },
+              paint: { 'line-color': '#38bdf8', 'line-width': 6, 'line-opacity': 0.95 }
+          });
+      }
+      if (!map.getLayer('reroute-arrows')) {
+          map.addLayer({
+              id: 'reroute-arrows',
+              type: 'symbol',
+              source: 'reroute-arrows-src',
+              layout: {
+                  'text-field': '➤',
+                  'text-font': detectFontStack(),
+                  'text-size': 20,
+                  'text-rotate': ['get', 'heading'],
+                  'text-rotation-alignment': 'map',
+                  'text-allow-overlap': true,
+                  'text-ignore-placement': true
+              },
+              paint: { 'text-color': '#7dd3fc', 'text-halo-color': '#075985', 'text-halo-width': 1.5 }
+          });
+      }
       positionClosedRoadLayers();
       refreshClosedRoadOverlay();
+      refreshRerouteOverlay();
   }
 
   function positionClosedRoadLayers() {
-      const layerIds = ['closed-roads-line', 'closed-road-sign', 'closed-road-sign-bar'];
+      const layerIds = ['reroute-paths-line', 'reroute-arrows', 'closed-roads-line', 'closed-road-sign', 'closed-road-sign-bar'];
       const layers = map.getStyle().layers || [];
       const existing = layerIds.filter(id => map.getLayer(id));
       const start = layers.length - existing.length;
@@ -416,12 +756,26 @@ import { createTerrainController } from './src/terrain-survey.js';
   }
 
   let closedRoadLayersPositionScheduled = false;
+  let roadNetworkRefreshScheduled = false;
   function schedulePositionClosedRoadLayers() {
       if (closedRoadLayersPositionScheduled) return;
       closedRoadLayersPositionScheduled = true;
       requestAnimationFrame(() => {
           closedRoadLayersPositionScheduled = false;
           positionClosedRoadLayers();
+      });
+  }
+
+  function scheduleRoadNetworkRefresh() {
+      if (roadNetworkRefreshScheduled) return;
+      roadNetworkRefreshScheduled = true;
+      requestAnimationFrame(() => {
+          setTimeout(() => {
+              roadNetworkRefreshScheduled = false;
+              extractRoadPathsFromTiles();
+              for (const road of closedRoadSegments.values()) showTrafficReroute(road);
+              updateTrafficDemand();
+          }, 0);
       });
   }
 
@@ -457,6 +811,8 @@ import { createTerrainController } from './src/terrain-survey.js';
           const line = lines.filter(coords => coords && coords.length >= 2)
               .map(coords => {
                   let distance = Infinity;
+                  let distanceAlong = 0;
+                  let cumulative = 0;
                   for (let i = 1; i < coords.length; i++) {
                       const a = map.project(coords[i - 1]);
                       const b = map.project(coords[i]);
@@ -465,30 +821,84 @@ import { createTerrainController } from './src/terrain-survey.js';
                       const t = lengthSquared
                           ? Math.max(0, Math.min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared))
                           : 0;
-                      distance = Math.min(distance, Math.hypot(point.x - (a.x + t * dx), point.y - (a.y + t * dy)));
+                      const segmentDistance = Math.hypot(point.x - (a.x + t * dx), point.y - (a.y + t * dy));
+                      const segmentLength = haversineMeters(
+                          coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]
+                      );
+                      if (segmentDistance < distance) {
+                          distance = segmentDistance;
+                          distanceAlong = cumulative + segmentLength * t;
+                      }
+                      cumulative += segmentLength;
                   }
-                  return { coords, distance };
+                  return { coords, distance, distanceAlong };
               })
-              .sort((a, b) => a.distance - b.distance)[0]?.coords;
-          if (line) return { cls, coords: line };
+              .sort((a, b) => a.distance - b.distance)[0];
+          if (line) {
+              const displayCoords = roadDisplaySegment(line.coords, line.distanceAlong);
+              return { cls, coords: line.coords, displayCoords };
+          }
       }
       return null;
   }
 
+  function roadDisplaySegment(coords, centerDistance, halfLengthMeters = 35) {
+      if (coords.length < 2) return coords.map(coord => coord.slice(0, 2));
+      const cumulative = [0];
+      for (let i = 1; i < coords.length; i++) {
+          cumulative.push(cumulative[i - 1] + haversineMeters(
+              coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]
+          ));
+      }
+      const totalLength = cumulative[cumulative.length - 1];
+      if (totalLength <= halfLengthMeters * 2) return coords.map(coord => coord.slice(0, 2));
+
+      const positionAt = distance => {
+          for (let i = 1; i < cumulative.length; i++) {
+              if (distance > cumulative[i]) continue;
+              const length = cumulative[i] - cumulative[i - 1];
+              const fraction = length ? (distance - cumulative[i - 1]) / length : 0;
+              return [
+                  coords[i - 1][0] + (coords[i][0] - coords[i - 1][0]) * fraction,
+                  coords[i - 1][1] + (coords[i][1] - coords[i - 1][1]) * fraction
+              ];
+          }
+          return coords[coords.length - 1].slice(0, 2);
+      };
+      const startDistance = Math.max(0, centerDistance - halfLengthMeters);
+      const endDistance = Math.min(totalLength, centerDistance + halfLengthMeters);
+      const segment = [positionAt(startDistance)];
+      for (let i = 1; i < coords.length - 1; i++) {
+          if (cumulative[i] > startDistance && cumulative[i] < endDistance) {
+              segment.push(coords[i].slice(0, 2));
+          }
+      }
+      segment.push(positionAt(endDistance));
+      return segment;
+  }
+
   function findClosedRoadAtPoint(point) {
-      if (!map.getLayer('closed-roads-line')) return null;
-      let hits;
-      try {
-          hits = map.queryRenderedFeatures(point, { layers: ['closed-roads-line'] });
-      } catch (error) {
-          dbg(`Closed road selection failed: ${error.message}`);
-          return null;
+      let nearest = null;
+      let nearestDistance = 18;
+      for (const road of closedRoadSegments.values()) {
+          const coords = road.displayCoords || road.coords;
+          for (let i = 1; i < coords.length; i++) {
+              const a = map.project(coords[i - 1]);
+              const b = map.project(coords[i]);
+              const dx = b.x - a.x;
+              const dy = b.y - a.y;
+              const lengthSquared = dx * dx + dy * dy;
+              const t = lengthSquared
+                  ? Math.max(0, Math.min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared))
+                  : 0;
+              const distance = Math.hypot(point.x - (a.x + t * dx), point.y - (a.y + t * dy));
+              if (distance < nearestDistance) {
+                  nearest = road;
+                  nearestDistance = distance;
+              }
+          }
       }
-      for (const feature of hits || []) {
-          const key = feature.properties && feature.properties.key;
-          if (key && closedRoadSegments.has(key)) return closedRoadSegments.get(key);
-      }
-      return null;
+      return nearest;
   }
 
   function setRoadClosureMode(mode) {
@@ -510,7 +920,7 @@ import { createTerrainController } from './src/terrain-survey.js';
 
       roadClosureMode = mode;
       map.getCanvas().style.cursor = 'crosshair';
-      if (map.isStyleLoaded()) ensureClosedRoadOverlay();
+      if (map.getStyle()) ensureClosedRoadOverlay();
       updateRoadClosureButtons();
       logPrompt('info', mode === 'close'
           ? 'Road closing ON — click a road to close it and reroute traffic.'
@@ -522,20 +932,24 @@ import { createTerrainController } from './src/terrain-survey.js';
       if (!road) return logPrompt('info', 'No traffic road at that spot.');
       const key = roadSegmentKey(road.cls, road.coords);
       if (closedRoadSegments.has(key)) return logPrompt('info', 'That road segment is already closed.');
-      closedRoadSegments.set(key, { key, cls: road.cls, coords: road.coords });
+      closedRoadSegments.set(key, {
+          key,
+          cls: road.cls,
+          coords: road.coords,
+          displayCoords: road.displayCoords
+      });
       refreshClosedRoadOverlay();
-      extractRoadPathsFromTiles();
-      updateTrafficDemand();
+      scheduleRoadNetworkRefresh();
       logPrompt('bot', 'Road closed; traffic has been rerouted onto open roads.');
   }
 
   function openRoadAtPoint(point) {
       const road = findClosedRoadAtPoint(point);
       if (!road) return logPrompt('info', 'No closed road at that spot.');
+      clearTrafficReroute(road.key);
       closedRoadSegments.delete(road.key);
       refreshClosedRoadOverlay();
-      extractRoadPathsFromTiles();
-      updateTrafficDemand();
+      scheduleRoadNetworkRefresh();
       logPrompt('bot', 'Road reopened; traffic can use it again.');
   }
 
@@ -808,21 +1222,13 @@ import { createTerrainController } from './src/terrain-survey.js';
           if (!c) break;
           trafficCars.push(c);
       }
-      while (trafficCars.length > target) {
-          let removableIndex = trafficCars.length - 1;
-          while (removableIndex >= 0 && trafficCars[removableIndex].returnPath) removableIndex--;
-          if (removableIndex === -1) break;
-          trafficCars.splice(removableIndex, 1);
-      }
       const el = document.getElementById('traffic-count');
       if (el) el.textContent = String(trafficCars.length);
       updateTrafficLayer();
-      refreshClosedRoadOverlay();
-      positionClosedRoadLayers();
   }
 
   function updateTrafficDemand() {
-      if (!map.isStyleLoaded()) return;
+      if (!map.getStyle()) return;
       const demand = trafficDemandAt(new Date());
       const target = demand.count;
       trafficTargetCount = target;
@@ -1647,7 +2053,91 @@ import { createTerrainController } from './src/terrain-survey.js';
   function commitPendingBuilding() {
       const committed = buildingLifecycle.commitPendingBuilding();
       updateBuildingBuildButton();
+      if (committed) {
+          const building = customBuildings.get(`custom-${buildingIdCounter}`);
+          if (building) showBuildingEstimate(building);
+      }
       return committed;
+  }
+
+  function footprintAreaSquareMeters(coords) {
+      if (!Array.isArray(coords) || coords.length < 3) return 0;
+      const latitude = coords.reduce((sum, point) => sum + point[1], 0) / coords.length;
+      const metersPerDegreeLon = 111320 * Math.cos(latitude * Math.PI / 180);
+      const points = coords.map(([lon, lat]) => [lon * metersPerDegreeLon, lat * 111320]);
+      let twiceArea = 0;
+      for (let i = 0; i < points.length; i++) {
+          const [x1, y1] = points[i];
+          const [x2, y2] = points[(i + 1) % points.length];
+          twiceArea += x1 * y2 - x2 * y1;
+      }
+      return Math.abs(twiceArea) / 2;
+  }
+
+  function showBuildingEstimate(building) {
+      const center = centerOfCoordinates(building.coords);
+      if (!isInVisibleMapArea(center)) {
+          buildingInsightMarkers.get(building.id)?.remove();
+          buildingInsightMarkers.delete(building.id);
+          return;
+      }
+      const footprint = footprintAreaSquareMeters(building.coords);
+      const floorCount = Math.max(1, building.height / 3.2);
+      const grossFloorArea = footprint * floorCount;
+      const cost = grossFloorArea * 700;
+      const co2 = grossFloorArea * 450;
+      const addedPeakTraffic = Math.max(1, Math.round(grossFloorArea / 100 * 0.5));
+      const durationMonths = Math.max(2, Math.ceil(grossFloorArea / 2500 * 12));
+      const container = document.createElement('section');
+      container.className = 'map-ai-panel building-ai-panel';
+      const heading = document.createElement('strong');
+      heading.textContent = `Building ${building.id.replace('custom-', '')} impact`;
+      const details = document.createElement('div');
+      details.textContent = [
+          `Footprint: ${Math.round(footprint).toLocaleString()} m² · gross floor: ${Math.round(grossFloorArea).toLocaleString()} m²`,
+          `Cost: $${Math.round(cost).toLocaleString()} · CO₂e: ${Math.round(co2).toLocaleString()} kg`,
+          `Nearby peak: +${addedPeakTraffic} vehicle trips/hour · Build time: ~${durationMonths} months`
+      ].join('\n');
+      const assumptions = document.createElement('div');
+      assumptions.className = 'map-ai-assumptions';
+      assumptions.textContent = 'Concrete + standard materials; $700/m² and 450 kg CO₂e/m² of gross floor area, 0.5 peak-hour trips per 100 m², and ~12 months per 2,500 m² (minimum 2 months). Planning estimate only.';
+      const note = document.createElement('div');
+      note.className = 'map-ai-note';
+      note.textContent = geminiAssistant.hasApiKey() ? 'Gemini is preparing an estimate note…' : 'Set an AI key for a Gemini explanation.';
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.className = 'map-ai-close';
+      close.setAttribute('aria-label', 'Dismiss building estimate');
+      close.textContent = '×';
+      close.addEventListener('click', () => {
+          buildingInsightMarkers.get(building.id)?.remove();
+          buildingInsightMarkers.delete(building.id);
+      });
+      container.append(heading, details, assumptions, note, close);
+      buildingInsightMarkers.get(building.id)?.remove();
+      const marker = new maplibregl.Marker({
+          element: container,
+          anchor: 'bottom',
+          pitchAlignment: 'map'
+      }).setLngLat(center);
+      if (typeof marker.setAltitude === 'function') marker.setAltitude(building.height + 5);
+      marker.addTo(map);
+      buildingInsightMarkers.set(building.id, marker);
+
+      if (geminiAssistant.hasApiKey()) {
+          geminiAssistant.generateContent(
+              `Write one brief, cautious sentence explaining this rough building estimate. Do not introduce or change numbers. ` +
+              `Assume a concrete structure and standard materials. Footprint ${Math.round(footprint)} m2, ` +
+              `gross floor area ${Math.round(grossFloorArea)} m2, estimated cost $${Math.round(cost)}, ` +
+              `embodied CO2 ${Math.round(co2)} kg, added peak-hour vehicles ${addedPeakTraffic}, ` +
+              `construction duration ${durationMonths} months.`
+          ).then(result => {
+              note.textContent = result.text;
+          }).catch(error => {
+              note.textContent = 'Gemini explanation unavailable; figures are local estimates.';
+              logPrompt('error', `Building estimate Gemini error: ${error.message}`);
+          });
+      }
   }
   function cancelPendingBuilding() {
       buildingLifecycle.cancelPendingBuilding();
@@ -1757,16 +2247,25 @@ import { createTerrainController } from './src/terrain-survey.js';
       buildingSelection.deselectBuilding();
   }
   function deleteSelectedBuilding() {
+      const deletedId = selectedBuildingId;
       buildingLifecycle.deleteSelectedBuilding();
+      if (deletedId && !customBuildings.has(deletedId)) {
+          buildingInsightMarkers.get(deletedId)?.remove();
+          buildingInsightMarkers.delete(deletedId);
+      }
   }
   function clearAllCustomBuildings() {
       buildingLifecycle.clearAllCustomBuildings();
+      for (const marker of buildingInsightMarkers.values()) marker.remove();
+      buildingInsightMarkers.clear();
   }
   function listCustomBuildings() {
       buildingLifecycle.listCustomBuildings();
   }
   function setBuildingHeight(n) {
       buildingLifecycle.setBuildingHeight(n);
+      const building = selectedBuildingId && customBuildings.get(selectedBuildingId);
+      if (building) showBuildingEstimate(building);
   }
   function setBuildingColor(name) {
       buildingLifecycle.setBuildingColor(name);
@@ -1779,6 +2278,8 @@ import { createTerrainController } from './src/terrain-survey.js';
   }
   function endBuildingDrag() {
       buildingInteraction.endBuildingDrag();
+      const building = selectedBuildingId && customBuildings.get(selectedBuildingId);
+      if (building) showBuildingEstimate(building);
   }
 
   const zoneController = createZoneController({
@@ -1937,6 +2438,9 @@ import { createTerrainController } from './src/terrain-survey.js';
   const promptSend  = document.getElementById('prompt-send');
   const promptLog   = document.getElementById('prompt-log');
     const promptHistoryToggle = document.getElementById('prompt-history-toggle');
+  const geminiKeyPanel = document.getElementById('gemini-key-panel');
+  const geminiKeyInput = document.getElementById('gemini-api-key');
+  const geminiKeyStatus = document.getElementById('gemini-key-status');
 
     function setPromptHistoryExpanded(expanded) {
             promptLog.classList.toggle('visible', expanded);
@@ -1973,6 +2477,78 @@ import { createTerrainController } from './src/terrain-survey.js';
       promptLog.scrollTop = promptLog.scrollHeight;
   }
 
+  async function askGemini(prompt) {
+      const rainfallTool = {
+          name: 'forecast_flood_zones',
+          description: 'Use terrain elevations to identify and create multiple flood-risk zones for the stated predicted rainfall.',
+          parameters: {
+              type: 'OBJECT',
+              properties: {
+                  rainfall_mm: {
+                      type: 'NUMBER',
+                      description: 'Predicted rainfall in millimeters; must be greater than 0 and no more than 1000.'
+                  }
+              },
+              required: ['rainfall_mm']
+          }
+      };
+      const mapCommandTool = {
+          name: 'execute_map_command',
+          description: 'Run one supported, non-destructive map command explicitly requested by the user.',
+          parameters: {
+              type: 'OBJECT',
+              properties: {
+                  command: { type: 'STRING', description: 'A supported map command, such as "close road" or "terrain on".' }
+              },
+              required: ['command']
+          }
+      };
+      try {
+          const forecastRequest = /\b(?:rain|rainfall|flood|precipitation)\b/i.test(prompt) && /\d/.test(prompt);
+          const tools = forecastRequest ? [rainfallTool] : [rainfallTool, mapCommandTool];
+          const result = await geminiAssistant.generateContent(
+              `You are the assistant for a 3D city map. For a request about predicted rain or flood risk, call ` +
+              `forecast_flood_zones with the rainfall in millimeters. For an explicit request to change the map, ` +
+              `you may call execute_map_command using a supported command. Never claim a map change unless the tool was called. ` +
+              `For other questions, answer briefly and do not claim to change the map. User request: ${prompt}`,
+              tools,
+              forecastRequest ? 'ANY' : 'AUTO'
+          );
+          if (!result.functionCall) {
+              logPrompt('bot', result.text);
+              return;
+          }
+          if (result.functionCall.name === 'execute_map_command') {
+              const command = String(result.functionCall.args?.command || '').trim();
+              const allowed = /^(?:close|block|open|reopen|unblock)\s+roads?$|^(?:stop|end|exit|done)\s+(?:closing|opening)\s+roads?$|^(?:terrain|topo)\s+(?:on|off|enable|disable)$|^(?:show|enable|display|hide|disable)\s+buildings?$|^(?:show|enable|display|hide|disable)\s+(?:map\s+)?labels?$|^(?:shadows?|ao|ambient\s+occlusion)\s+(?:on|off|enable|disable)$/i;
+              if (!allowed.test(command)) {
+                  throw new Error(`Gemini requested a map command that is not allowed: "${command}"`);
+              }
+              const matchingCommand = COMMANDS.find(item => item.re.test(command));
+              const match = matchingCommand && command.match(matchingCommand.re);
+              if (!matchingCommand || !match) throw new Error(`Unsupported map command: "${command}"`);
+              logPrompt('info', `Gemini ran map command: ${command}`);
+              matchingCommand.run(match);
+              return;
+          }
+          if (result.functionCall.name !== 'forecast_flood_zones') throw new Error(`Gemini requested an unsupported action: ${result.functionCall.name}`);
+          const rainfallMm = Number(result.functionCall.args?.rainfall_mm);
+          if (!Number.isFinite(rainfallMm) || rainfallMm <= 0 || rainfallMm > 1000) {
+              throw new Error('Gemini returned an invalid rainfall amount; use a value between 0 and 1000 mm.');
+          }
+          const areas = terrainController.findFloodRiskAreas(rainfallMm);
+          if (!areas.length) {
+              logPrompt('bot', `No significant low-elevation areas were found for ${rainfallMm} mm of predicted rain.`);
+              return;
+          }
+          const created = areas.map(area => zoneController.addZone(area.center, area.radiusMeters, 'Flood'));
+          logPrompt('bot', `Created ${created.length} Flood zone(s) for ${rainfallMm} mm of predicted rain, based on local terrain depressions.`);
+          logPrompt('info', `Flood-zone IDs: ${created.map(zone => zone.id).join(', ')}`);
+      } catch (error) {
+          logPrompt('error', `Gemini error: ${error.message}`);
+      }
+  }
+
   function printHelp() {
       logPrompt('info', 'Commands:');
       logPrompt('info', '• label buildings / unlabel buildings');
@@ -1998,6 +2574,7 @@ import { createTerrainController } from './src/terrain-survey.js';
     logPrompt('info', '• traffic status · typical demand is estimated from local time and weekday');
       logPrompt('info', '• shadows on / shadows off / shadows <0-1> / shadows offset <px>');
       logPrompt('info', '• terrain on / terrain off');
+      logPrompt('info', '• Set an AI key, then ask Gemini about the map or predicted rainfall (mm) to create flood zones.');
       logPrompt('info', '• pick tiles / stop picking / hide tile / show all tiles');
       logPrompt('info', '• haze <0-100>% / auto / off');
       logPrompt('info', '• roads <color> / roads <0-100>% / road border <color>');
@@ -2033,6 +2610,7 @@ import { createTerrainController } from './src/terrain-survey.js';
       refreshDrawnRoads();
       setDraftData();
       roadClosureMode = null;
+      for (const key of [...rerouteGuidance.keys()]) clearTrafficReroute(key);
       closedRoadSegments.clear();
       refreshClosedRoadOverlay();
       updateRoadClosureButtons();
@@ -2147,6 +2725,7 @@ import { createTerrainController } from './src/terrain-survey.js';
             saveCustomBuildings();
             const note = parsed.height !== null ? '' : ` (default ${buildingDefaultHeight}m)`;
             logPrompt('bot', `Created building ${id}: ${coords.length} vertices, ${height}m${note}.`);
+            showBuildingEstimate(building);
         }
       },
 
@@ -2356,7 +2935,7 @@ import { createTerrainController } from './src/terrain-survey.js';
               return;
           }
       }
-      logPrompt('error', `Didn't understand: "${t}". Type "help".`);
+      void askGemini(t);
   }
 
   promptSend.addEventListener('click', () => {
@@ -2371,6 +2950,28 @@ import { createTerrainController } from './src/terrain-survey.js';
   });
   promptHistoryToggle.addEventListener('click', () => {
       setPromptHistoryExpanded(promptHistoryToggle.getAttribute('aria-expanded') !== 'true');
+  });
+  document.getElementById('gemini-key-toggle').addEventListener('click', () => {
+      geminiKeyPanel.classList.toggle('hidden');
+      if (!geminiKeyPanel.classList.contains('hidden')) geminiKeyInput.focus();
+  });
+  geminiKeyPanel.addEventListener('submit', event => {
+      event.preventDefault();
+      try {
+          geminiAssistant.setApiKey(geminiKeyInput.value);
+          geminiKeyInput.value = '';
+          geminiKeyStatus.textContent = 'Key set in memory only; it is not saved to browser storage.';
+          logPrompt('info', 'Gemini API key set for this page session.');
+      } catch (error) {
+          geminiKeyStatus.textContent = error.message;
+          logPrompt('error', error.message);
+      }
+  });
+  document.getElementById('gemini-key-clear').addEventListener('click', () => {
+      geminiAssistant.clearApiKey();
+      geminiKeyInput.value = '';
+      geminiKeyStatus.textContent = 'No key set.';
+      logPrompt('info', 'Gemini API key cleared.');
   });
 
     updateBuildingLabelsToggle();

@@ -71,6 +71,27 @@ html, body { margin: 0; padding: 0; height: 100%; }
           cursor: pointer;
       }
       #prompt-history-toggle:hover { background: rgba(255,255,255,0.1); color: #fff; }
+      #gemini-key-toggle, #gemini-key-save, #gemini-key-clear {
+          flex: 0 0 auto; border: 1px solid rgba(255,255,255,0.18);
+          border-radius: 5px; padding: 6px 9px; color: #e2e8f0;
+          background: rgba(255,255,255,0.06); font: inherit; cursor: pointer;
+      }
+      #gemini-key-toggle:hover, #gemini-key-clear:hover { background: rgba(255,255,255,0.14); }
+      #gemini-key-panel {
+          display: flex; flex-direction: column; gap: 7px;
+          padding: 10px 12px; border-radius: 8px;
+          color: #cbd5e1; background: rgba(15,20,32,0.96);
+          box-shadow: 0 4px 14px rgba(0,0,0,0.35); font-size: 11px;
+      }
+      #gemini-key-panel.hidden { display: none; }
+      .gemini-key-row { display: flex; gap: 6px; }
+      #gemini-api-key {
+          min-width: 0; flex: 1; padding: 7px 9px; border-radius: 5px;
+          border: 1px solid rgba(255,255,255,0.18); color: #f1f5f9;
+          background: rgba(255,255,255,0.07); font: inherit;
+      }
+      #gemini-key-save { background: #2563eb; border-color: #2563eb; color: white; }
+      #gemini-key-status { color: #94a3b8; }
       #prompt-send {
           background: #3b82f6; color: #fff; border: none; border-radius: 5px;
           padding: 6px 14px; font: inherit; font-weight: 600; cursor: pointer;
@@ -78,6 +99,28 @@ html, body { margin: 0; padding: 0; height: 100%; }
       }
       #prompt-send:hover { background: #2563eb; }
       #prompt-send:active { background: #1d4ed8; }
+      .map-ai-panel {
+          position: relative; min-width: 190px; max-width: min(330px, 75vw);
+          padding: 9px 26px 9px 11px; border: 1px solid rgba(125,211,252,0.8);
+          border-radius: 5px; color: #eff6ff; background: rgba(8,25,43,0.92);
+          box-shadow: 0 5px 18px rgba(0,0,0,0.38);
+          white-space: pre-line; font: 11px/1.45 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          pointer-events: auto;
+      }
+      .map-ai-panel strong { display: block; margin-bottom: 4px; color: #bae6fd; font-size: 12px; }
+      .map-ai-assumptions { margin-top: 5px; color: #94a3b8; font-size: 10px; }
+      .map-ai-note { margin-top: 5px; color: #cbd5e1; font-style: italic; }
+      .map-ai-close {
+          position: absolute; top: 3px; right: 5px; border: 0; padding: 0 3px;
+          color: #cbd5e1; background: transparent; font-size: 18px; line-height: 1; cursor: pointer;
+      }
+      .map-reroute-panel { border-color: #38bdf8; }
+      .map-reroute-panel strong { color: #7dd3fc; }
+      .maplibregl-marker:has(.map-ai-panel) { z-index: 20; }
+      @media (max-width: 700px) {
+          #prompt-container { width: calc(100% - 24px); top: 10px; }
+          #prompt-history-toggle { display: none; }
+      }
 
       #tools-drawer {
           position: absolute;

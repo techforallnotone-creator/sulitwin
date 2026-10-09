@@ -78,8 +78,19 @@
     <button id="prompt-history-toggle" type="button" aria-expanded="false" aria-controls="prompt-log" title="Show prompt history">History ▸</button>
     <input id="prompt-input" type="text" autocomplete="off"
       placeholder='Try: build building 20m 45.443,35.557 … · help' />
+    <button id="gemini-key-toggle" type="button" title="Set Gemini API key">AI key</button>
     <button id="prompt-send" type="button">Send</button>
   </div>
+  <form id="gemini-key-panel" class="hidden">
+    <label for="gemini-api-key">Gemini API key (kept in memory until this page is closed)</label>
+    <div class="gemini-key-row">
+      <input id="gemini-api-key" type="password" autocomplete="off" spellcheck="false"
+        placeholder="Paste your Google AI Studio API key" />
+      <button id="gemini-key-save" type="submit">Save key</button>
+      <button id="gemini-key-clear" type="button">Clear</button>
+    </div>
+    <div id="gemini-key-status" role="status">No key set.</div>
+  </form>
 </div>
 
 <div id="height-panel" class="hidden">

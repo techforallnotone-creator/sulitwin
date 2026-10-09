@@ -25,6 +25,92 @@ export function createTerrainController({ map, state, dbg, logPrompt }) {
         return maxLat - y * cellLat;
     }
 
+    function sampleElevation(lon, lat) {
+        if (!Number.isFinite(lon) || !Number.isFinite(lat)
+            || lon < minLon || lon > maxLon || lat < minLat || lat > maxLat) return null;
+        const x = (lon - minLon) / cellLon;
+        const y = (maxLat - lat) / cellLat;
+        const x0 = Math.floor(x);
+        const y0 = Math.floor(y);
+        const x1 = Math.min(width - 1, x0 + 1);
+        const y1 = Math.min(height - 1, y0 + 1);
+        const topLeft = valueAt(x0, y0);
+        const topRight = valueAt(x1, y0);
+        const bottomLeft = valueAt(x0, y1);
+        const bottomRight = valueAt(x1, y1);
+        if ([topLeft, topRight, bottomLeft, bottomRight].some(value => value == null)) return null;
+        const tx = x - x0;
+        const ty = y - y0;
+        return (topLeft * (1 - tx) + topRight * tx) * (1 - ty)
+            + (bottomLeft * (1 - tx) + bottomRight * tx) * ty;
+    }
+
+    function findFloodRiskAreas(rainfallMm) {
+        if (!Number.isFinite(rainfallMm) || rainfallMm <= 0) {
+            throw new Error('Rainfall must be a positive number of millimeters.');
+        }
+        const threshold = Math.max(0.4, 1.3 - Math.min(rainfallMm, 100) * 0.008);
+        const candidates = new Map();
+        for (let y = 1; y < height - 1; y++) {
+            for (let x = 1; x < width - 1; x++) {
+                const current = valueAt(x, y);
+                let neighborTotal = 0;
+                let neighborCount = 0;
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        if (!dx && !dy) continue;
+                        const neighbor = valueAt(x + dx, y + dy);
+                        if (neighbor == null) continue;
+                        neighborTotal += neighbor;
+                        neighborCount++;
+                    }
+                }
+                const depth = neighborCount ? neighborTotal / neighborCount - current : 0;
+                if (depth >= threshold) candidates.set(y * width + x, { x, y, depth });
+            }
+        }
+
+        const cellMeters = Math.max(
+            cellLat * 111320,
+            cellLon * 111320 * Math.cos(((minLat + maxLat) / 2) * Math.PI / 180)
+        );
+        const visited = new Set();
+        const regions = [];
+        for (const [startIndex, start] of candidates) {
+            if (visited.has(startIndex)) continue;
+            const queue = [start];
+            visited.add(startIndex);
+            let score = 0;
+            let sumX = 0;
+            let sumY = 0;
+            for (let head = 0; head < queue.length; head++) {
+                const point = queue[head];
+                score += point.depth;
+                sumX += point.x;
+                sumY += point.y;
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        if (!dx && !dy) continue;
+                        const index = (point.y + dy) * width + point.x + dx;
+                        const next = candidates.get(index);
+                        if (next && !visited.has(index)) {
+                            visited.add(index);
+                            queue.push(next);
+                        }
+                    }
+                }
+            }
+            const centerX = sumX / queue.length;
+            const centerY = sumY / queue.length;
+            regions.push({
+                center: [lonForX(centerX), latForY(centerY)],
+                radiusMeters: Math.min(120, Math.max(18, cellMeters * Math.sqrt(queue.length) * 0.8 + rainfallMm * 0.12)),
+                score
+            });
+        }
+        return regions.sort((a, b) => b.score - a.score).slice(0, 12);
+    }
+
     function interpolatedColor(elevationValue) {
         const stops = [
             [minElevation, '#d8e7cf'],
@@ -293,6 +379,8 @@ export function createTerrainController({ map, state, dbg, logPrompt }) {
         ensureTerrainLayers,
         updateVisibility,
         setEnabled,
+        sampleElevation,
+        findFloodRiskAreas,
         isEnabled: () => !!state.terrainVisible
     };
 }

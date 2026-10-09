@@ -322,6 +322,28 @@ export function createZoneController({
     return true;
   }
 
+  function addZone(center, radiusMeters, zoneClass = 'Flood') {
+    if (!ZONE_CLASSES[zoneClass]) throw new Error(`Invalid zone class: ${zoneClass}`);
+    if (!Array.isArray(center) || center.length !== 2 || !center.every(Number.isFinite)) {
+      throw new Error('Zone center must contain finite longitude and latitude values.');
+    }
+    if (!Number.isFinite(radiusMeters) || radiusMeters <= 0) {
+      throw new Error('Zone radius must be a positive number of meters.');
+    }
+    const nextIdNumber = getZoneIdCounter() + 1;
+    setZoneIdCounter(nextIdNumber);
+    const zone = {
+      id: `Z${nextIdNumber}`,
+      center: [center[0], center[1]],
+      radiusMeters: Math.min(500, radiusMeters),
+      class: zoneClass
+    };
+    getZones().set(zone.id, zone);
+    refreshZones();
+    saveZones();
+    return zone;
+  }
+
   function cancelPendingZone() {
     if (!getPendingZone()) return;
     setPendingZone(null);
@@ -429,6 +451,7 @@ export function createZoneController({
     showZoneClassPanel,
     hideZoneClassPanel,
     commitPendingZone,
+    addZone,
     cancelPendingZone,
     deleteZoneById,
     clearAllZones,
