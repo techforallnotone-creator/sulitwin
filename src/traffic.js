@@ -123,12 +123,13 @@ function carRectFromBasis(car, fwdOffset, length, width, fx, fy, mLon, mLat) {
 
 export function carRects(car) {
   const [, lat] = car.pos;
+  const scale = car.scale ?? 1;
   const h = car.heading * Math.PI / 180;
   const mLat = 111320;
   const mLon = 111320 * Math.cos(lat * Math.PI / 180);
   const fx = Math.sin(h), fy = Math.cos(h);
   return [
-    carRectFromBasis(car, 0, 4.2, 1.8, fx, fy, mLon, mLat),
-    carRectFromBasis(car, -0.3, 2.2, 1.6, fx, fy, mLon, mLat)
+    carRectFromBasis(car, 0, 3.2 * scale, 1.2 * scale, fx, fy, mLon, mLat),
+    carRectFromBasis(car, -0.2 * scale, 1.7 * scale, 0.95 * scale, fx, fy, mLon, mLat)
   ];
 }

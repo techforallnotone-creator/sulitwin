@@ -34,11 +34,14 @@ import { createZoneController } from './src/zones.js';
 import { createTerrainController } from './src/terrain-survey.js';
 import { createGeminiAssistant } from './src/gemini-assistant.js';
 import { preloadRegionTiles } from './src/tile-preloader.js';
+import { createFlagpoleController } from './src/flagpole.js';
 
   const MAX_BUILDING_LABELS = 10000;
   const CUSTOM_BUILDINGS_STORAGE_KEY = 'maplibre-custom-buildings-v1';
+  const BUILDING_NAMES_STORAGE_KEY = 'maplibre-building-names-v1';
 
   const state = { ...DEFAULTS };
+  const buildingNames = new Map();
   const geminiAssistant = createGeminiAssistant();
 
   const statusEl = document.getElementById('status');
@@ -163,7 +166,7 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
       container: 'map',
       maxBounds: [[REGION[0], REGION[1]], [REGION[2], REGION[3]]],
       minZoom: 15,
-      maxZoom: 19,
+      maxZoom: 21,
       maxTileCacheSize: 64,
       canvasContextAttributes: {antialias: true},
       transformRequest: (url, resourceType) => {
@@ -314,6 +317,8 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
   let buildingDeleteActive = false;
   let hoveredDeleteBuilding = null;
   let pendingBuilding = null;
+  let buildingNameMode = null;
+  let pendingBuildingNameKey = null;
 
   const zones = new Map();
   let zoneIdCounter = 0;
@@ -350,9 +355,29 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
   const trafficCars = [];
   const TRAFFIC_MIN_GAP_METERS = 5.5;
   const TRAFFIC_UPDATE_INTERVAL_MS = 50;
+  const TRAFFIC_CAR_WIDTH_METERS = 1.2;
+  const TRAFFIC_ROAD_EDGE_MARGIN_METERS = 0.25;
+  const TRAFFIC_LANE_OFFSET_METERS = 1.2;
+  let cachedRoadWidthZoom = NaN;
+  const cachedRoadWidthPixels = new Map();
   const TRAFFIC_SPEED_RANGES = {
       motorway: [18, 26], trunk: [14, 21], primary: [11, 17],
       secondary: [9, 14], tertiary: [7, 12]
+  };
+  const ROAD_WIDTH_LAYER_IDS = {
+      motorway: ['highway-motorway-casing', 'highway-motorway'],
+      trunk: ['highway-trunk-casing', 'highway-trunk'],
+      primary: ['highway-primary-casing', 'highway-primary'],
+      secondary: ['highway-secondary-tertiary-casing', 'highway-secondary-tertiary'],
+      tertiary: ['highway-secondary-tertiary-casing', 'highway-secondary-tertiary'],
+      minor: ['highway-minor-casing', 'highway-minor'],
+      residential: ['highway-minor-casing', 'highway-minor'],
+      street: ['highway-minor-casing', 'highway-minor'],
+      service: ['highway-minor-casing', 'highway-minor'],
+      track: ['highway-minor-casing', 'highway-minor'],
+      busway: ['highway-minor-casing', 'highway-minor'],
+      bus_guideway: ['highway-minor-casing', 'highway-minor'],
+      raceway: ['highway-minor-casing', 'highway-minor']
   };
   const TRAFFIC_CABIN_PROPERTIES = { part: 'cabin', color: '#1f2937' };
   let trafficTargetCount = 0;
@@ -1189,6 +1214,7 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
       for (const [id, path] of nextPaths) roadPaths.set(id, path);
       for (const [key, id] of nextPathKeys) roadPathKeys.set(key, id);
       rebuildVisibleRoadSpawnLocations();
+      refreshTrafficRoadClearance();
       rerouteCarsOnUnavailablePaths(previousPathsById);
       const el = document.getElementById('traffic-roads');
       if (el) el.textContent = roadPaths.size;
@@ -1196,6 +1222,180 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
           .map(([k, v]) => `${k}:${v}`).join(',') || 'none';
       dbg(`Traffic: ${roadPaths.size} paths from ${segments.length} segs (${queried} feats, classes ${classSummary}).`);
       return roadPaths.size;
+  }
+
+  function zoomLineWidth(expression, zoom) {
+      if (typeof expression === 'number') return expression;
+      if (!Array.isArray(expression) || expression[0] !== 'interpolate' ||
+          expression[2]?.[0] !== 'zoom' || expression.length < 7) return null;
+
+      const base = expression[1]?.[0] === 'exponential' ? expression[1][1] : 1;
+      for (let i = 3; i < expression.length - 2; i += 2) {
+          const lowerZoom = expression[i];
+          const lowerWidth = expression[i + 1];
+          const upperZoom = expression[i + 2];
+          const upperWidth = expression[i + 3];
+          if (zoom <= upperZoom) {
+              if (zoom <= lowerZoom) return lowerWidth;
+              const progress = base === 1
+                  ? (zoom - lowerZoom) / (upperZoom - lowerZoom)
+                  : (base ** (zoom - lowerZoom) - 1) / (base ** (upperZoom - lowerZoom) - 1);
+              return lowerWidth + (upperWidth - lowerWidth) * progress;
+          }
+      }
+      return expression.at(-1);
+  }
+
+  function roadWidthMeters(path, distance = path.length / 2) {
+      const candidates = ROAD_WIDTH_LAYER_IDS[path.cls] || ROAD_WIDTH_LAYER_IDS.minor;
+      let widthPixels = null;
+      const zoom = map.getZoom();
+      if (zoom !== cachedRoadWidthZoom) {
+          cachedRoadWidthPixels.clear();
+          cachedRoadWidthZoom = zoom;
+      }
+      if (cachedRoadWidthPixels.has(path.cls)) {
+          widthPixels = cachedRoadWidthPixels.get(path.cls);
+      }
+      try {
+          if (widthPixels === null) {
+              const layers = map.getStyle().layers || [];
+              const layer = candidates.map(id => layers.find(item => item.id === id)).find(Boolean);
+              if (layer) widthPixels = zoomLineWidth(layer.paint?.['line-width'], zoom);
+              if (widthPixels > 0) cachedRoadWidthPixels.set(path.cls, widthPixels);
+          }
+      } catch (error) {
+          dbg(`Road width unavailable for ${path.cls}: ${error.message}`);
+      }
+      if (!(widthPixels > 0)) {
+          const fallbackWidths = {
+              motorway: 12, trunk: 10, primary: 9, secondary: 8, tertiary: 6,
+              minor: 4, residential: 4, street: 4, service: 3, track: 3
+          };
+          return fallbackWidths[path.cls] || 4;
+      }
+
+      const position = samplePathPosition(path, distance, 1, 0);
+      const [longitude, latitude] = position.pos;
+      const heading = position.heading * Math.PI / 180;
+      const metersLongitude = 111320 * Math.cos(latitude * Math.PI / 180);
+      const edge = map.project([
+          longitude + Math.cos(heading) / metersLongitude,
+          latitude - Math.sin(heading) / 111320
+      ]);
+      const center = map.project(position.pos);
+      const pixelsPerMeter = Math.hypot(edge.x - center.x, edge.y - center.y);
+      return pixelsPerMeter > 0 ? widthPixels / pixelsPerMeter : 4;
+  }
+
+  function vehicleScaleForRoad(width) {
+      return Math.min(1, Math.max(0, (width - 2 * TRAFFIC_ROAD_EDGE_MARGIN_METERS) /
+          (2 * TRAFFIC_CAR_WIDTH_METERS)));
+  }
+
+  function laneOffsetForRoad(width, direction, scale) {
+      const availableOffset = Math.max(0,
+          width / 2 - TRAFFIC_CAR_WIDTH_METERS * scale / 2 - TRAFFIC_ROAD_EDGE_MARGIN_METERS);
+      return -direction * Math.min(TRAFFIC_LANE_OFFSET_METERS, availableOffset);
+  }
+
+  function carFootprintFitsRoad(car, path, width) {
+      const halfRoadWidth = width / 2 - TRAFFIC_ROAD_EDGE_MARGIN_METERS;
+      if (halfRoadWidth <= 0) return false;
+
+      const corners = carRects(car)[0].slice(0, -1);
+      const body = [];
+      for (let i = 0; i < corners.length; i++) {
+          const point = corners[i];
+          const next = corners[(i + 1) % corners.length];
+          body.push(point, [(point[0] + next[0]) / 2, (point[1] + next[1]) / 2]);
+      }
+      let low = 1;
+      let high = path.cum.length - 1;
+      while (low < high) {
+          const middle = Math.floor((low + high) / 2);
+          if (path.cum[middle] < car.t) low = middle + 1;
+          else high = middle;
+      }
+      const startIndex = Math.max(0, low - 2);
+      const endIndex = Math.min(path.coords.length - 1, low + 2);
+
+      for (const point of body) {
+          const metersLongitude = 111320 * Math.cos(point[1] * Math.PI / 180);
+          let nearestDistance = Infinity;
+          for (let i = startIndex; i < endIndex; i++) {
+              const a = path.coords[i];
+              const b = path.coords[i + 1];
+              const x = (point[0] - a[0]) * metersLongitude;
+              const y = (point[1] - a[1]) * 111320;
+              const dx = (b[0] - a[0]) * metersLongitude;
+              const dy = (b[1] - a[1]) * 111320;
+              const lengthSquared = dx * dx + dy * dy;
+              const fraction = lengthSquared
+                  ? Math.max(0, Math.min(1, (x * dx + y * dy) / lengthSquared))
+                  : 0;
+              nearestDistance = Math.min(nearestDistance,
+                  Math.hypot(x - fraction * dx, y - fraction * dy));
+          }
+          if (nearestDistance > halfRoadWidth) return false;
+      }
+      return true;
+  }
+
+  function setCarFootprint(car, path, width, scale) {
+      car.scale = scale;
+      car.laneOffset = laneOffsetForRoad(width, car.direction, scale);
+      const position = samplePathPosition(path, car.t, car.direction, car.laneOffset);
+      car.pos = position.pos;
+      car.heading = position.heading;
+  }
+
+  function placeCarOnRoad(car, path, forceClearanceCheck = false) {
+      const needsClearanceCheck = forceClearanceCheck || car.clearancePathId !== path.id ||
+          car.clearanceDirection !== car.direction ||
+          Math.abs(car.t - car.clearanceDistance) >= 5;
+      if (needsClearanceCheck) {
+          car.clearanceRoadWidth = roadWidthMeters(path, car.t);
+          car.clearancePathId = path.id;
+          car.clearanceDirection = car.direction;
+          car.clearanceDistance = car.t;
+      }
+      const width = car.clearanceRoadWidth || 4;
+      if (needsClearanceCheck || car.scale === undefined) {
+          let scale = vehicleScaleForRoad(width);
+          setCarFootprint(car, path, width, scale);
+          if (!carFootprintFitsRoad(car, path, width)) {
+              let lower = 0;
+              let upper = scale;
+              for (let i = 0; i < 6; i++) {
+                  const candidate = (lower + upper) / 2;
+                  setCarFootprint(car, path, width, candidate);
+                  if (carFootprintFitsRoad(car, path, width)) lower = candidate;
+                  else upper = candidate;
+              }
+              setCarFootprint(car, path, width, lower);
+          }
+      } else {
+          setCarFootprint(car, path, width, car.scale);
+          if (!carFootprintFitsRoad(car, path, width)) {
+              let lower = 0;
+              let upper = car.scale;
+              for (let i = 0; i < 6; i++) {
+                  const candidate = (lower + upper) / 2;
+                  setCarFootprint(car, path, width, candidate);
+                  if (carFootprintFitsRoad(car, path, width)) lower = candidate;
+                  else upper = candidate;
+              }
+              setCarFootprint(car, path, width, lower);
+          }
+      }
+  }
+
+  function refreshTrafficRoadClearance() {
+      for (const car of trafficCars) {
+          const path = roadPaths.get(car.pathId) || car.returnPath;
+          if (path) placeCarOnRoad(car, path, true);
+      }
   }
 
   function rebuildVisibleRoadSpawnLocations() {
@@ -1232,10 +1432,7 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
       car.returnTarget = null;
       car.t = alternate.distance;
       car.direction = Math.random() < 0.5 ? 1 : -1;
-      car.laneOffset = -car.direction * 1.8;
-      const position = samplePathPosition(alternate.path, car.t, car.direction, car.laneOffset);
-      car.pos = position.pos;
-      car.heading = position.heading;
+      placeCarOnRoad(car, alternate.path);
       return true;
   }
 
@@ -1249,7 +1446,7 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
               car.returnPath = oldPath;
               car.returnTarget = car.t <= oldPath.length / 2 ? 0 : oldPath.length;
               car.direction = car.returnTarget === 0 ? -1 : 1;
-              car.laneOffset = -car.direction * 1.8;
+              placeCarOnRoad(car, oldPath);
               changed = true;
           }
           const atEndpoint = car.returnTarget === 0 ? car.t <= 0.5 : car.t >= car.returnPath.length - 0.5;
@@ -1276,26 +1473,23 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
       if (!chosen) return null;
       const direction = Math.random() < 0.5 ? 1 : -1;
       const [minSpeed, maxSpeed] = TRAFFIC_SPEED_RANGES[chosen.cls] || [5, 10];
-      const laneOffset = -direction * 1.8;
       const t = spawnLocation.distance;
-      const position = samplePathPosition(chosen, t, direction, laneOffset);
       const color = randomCarColor();
       const colorCss = `rgb(${color[0]},${color[1]},${color[2]})`;
-      return {
+      const car = {
           id: `car-${++carIdCounter}`,
           pathId: chosen.id,
           t,
           speed: minSpeed + Math.random() * (maxSpeed - minSpeed),
           direction,
-          laneOffset,
           color,
           bodyProperties: { part: 'body', color: colorCss },
           cabinProperties: TRAFFIC_CABIN_PROPERTIES,
-          pos: position.pos,
-          heading: position.heading,
           returnPath: null,
           returnTarget: null
       };
+      placeCarOnRoad(car, chosen);
+      return car;
   }
 
   function adjustTrafficCount(target) {
@@ -1377,9 +1571,7 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
       for (const car of trafficCars) {
           const path = roadPaths.get(car.pathId) || car.returnPath;
           if (!path) continue;
-          const s = samplePathPosition(path, car.t, car.direction, car.laneOffset);
-          car.pos = s.pos;
-          car.heading = s.heading;
+          placeCarOnRoad(car, path);
       }
       if (!map.isMoving()) updateTrafficLayer();
       trafficRafId = requestAnimationFrame(animateTraffic);
@@ -1394,6 +1586,7 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
       const latPadding = (north - south) * 0.1;
       for (const car of trafficCars) {
           const [lon, lat] = car.pos;
+          if (car.scale <= 0.05) continue;
           if (lon < west - lonPadding || lon > east + lonPadding || lat < south - latPadding || lat > north + latPadding) continue;
           const [body, cabin] = carRects(car);
           features.push({
@@ -1409,7 +1602,11 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
       }
       src.setData({ type: 'FeatureCollection', features });
   }
-  map.on('moveend', updateTrafficLayer);
+  map.on('moveend', () => {
+      rebuildVisibleRoadSpawnLocations();
+      refreshTrafficRoadClearance();
+      updateTrafficLayer();
+  });
 
   function setupTrafficOverlay() {
       ensureClosedRoadOverlay();
@@ -1693,6 +1890,7 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
               }))
           });
       }
+      updateNamedBuildingLabels();
   }
 
   let refreshDebounce = null;
@@ -1768,6 +1966,9 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
       if (map.getLayer('building-labels')) {
           map.setLayoutProperty('building-labels', 'visibility', state.buildingLabels ? vis : 'none');
       }
+      if (map.getLayer('building-names')) {
+          map.setLayoutProperty('building-names', 'visibility', vis);
+      }
       if (map.getLayer('building-highlights')) map.setLayoutProperty('building-highlights', 'visibility', vis);
       dbg(`Buildings: ${state.buildings ? 'visible' : 'hidden'}`);
   }
@@ -1794,6 +1995,142 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
 
   function updateBuildingLabels() {
       buildingLabelController.updateBuildingLabels();
+  }
+
+  function updateNamedBuildingLabels() {
+      if (!map.getStyle()) return;
+      const features = [];
+      const zoom = map.getZoom();
+      const pitch = map.getPitch() * Math.PI / 180;
+      const textSize = zoom <= 18
+          ? 12 + (zoom - 15) * (5 / 3)
+          : 17 + (zoom - 18) * (4 / 3);
+      for (const entry of currentVisibleBuildings) {
+          const name = buildingNames.get(entry.key);
+          if (!name) continue;
+          const base = Number(entry.base) || 0;
+          const height = Math.max(3, Number(entry.height) || 0);
+          const metersPerPixel = 156543.03392 * Math.cos(entry.xy[1] * Math.PI / 180) / (2 ** zoom);
+          const verticalOffset = metersPerPixel > 0
+              ? (base + height + 0.5) * Math.sin(pitch) / metersPerPixel / textSize
+              : 0;
+          features.push({
+              type: 'Feature',
+              properties: { name, offset: [0, -verticalOffset] },
+              geometry: {
+                  type: 'Point',
+                  coordinates: entry.xy
+              }
+          });
+      }
+      const data = { type: 'FeatureCollection', features };
+      if (map.getSource('building-names-src')) {
+          map.getSource('building-names-src').setData(data);
+      } else {
+          map.addSource('building-names-src', { type: 'geojson', data });
+      }
+      if (!map.getLayer('building-names')) {
+          map.addLayer({
+              id: 'building-names',
+              type: 'symbol',
+              source: 'building-names-src',
+              layout: {
+                  'text-field': ['get', 'name'],
+                  'text-font': detectFontStack(),
+                  'text-size': ['interpolate', ['linear'], ['zoom'], 15, 12, 18, 17, 21, 21],
+                  'text-offset': ['get', 'offset'],
+                  'text-max-width': 14,
+                  'text-allow-overlap': true,
+                  'text-ignore-placement': true,
+                  'text-pitch-alignment': 'viewport',
+                  'text-rotation-alignment': 'viewport'
+              },
+              paint: {
+                  'text-color': '#f8fafc',
+                  'text-halo-color': '#101827',
+                  'text-halo-width': 2.5,
+                  'text-halo-blur': 0.4
+              }
+          });
+      }
+      map.setLayoutProperty('building-names', 'visibility', state.buildings ? 'visible' : 'none');
+  }
+
+  function buildingNameKey(entry) {
+      return entry.kind === 'custom' ? `custom_${entry.id}` : entry.key;
+  }
+
+  function saveBuildingNames() {
+      try {
+          localStorage.setItem(BUILDING_NAMES_STORAGE_KEY, JSON.stringify([...buildingNames]));
+          return true;
+      } catch (error) {
+          logPrompt('error', `Could not save building names: ${error.message}`);
+          return false;
+      }
+  }
+
+  function loadBuildingNames() {
+      try {
+          const stored = localStorage.getItem(BUILDING_NAMES_STORAGE_KEY);
+          if (!stored) return;
+          const entries = JSON.parse(stored);
+          if (!Array.isArray(entries)) throw new Error('Saved building names have an invalid format.');
+          buildingNames.clear();
+          for (const pair of entries) {
+              if (!Array.isArray(pair) || pair.length < 2) continue;
+              const [key, rawName] = pair;
+              if (typeof key !== 'string' || typeof rawName !== 'string') continue;
+              const name = rawName.trim().slice(0, 60);
+              if (key && name) buildingNames.set(key, name);
+          }
+      } catch (error) {
+          logPrompt('error', `Could not load building names: ${error.message}`);
+      }
+  }
+
+  function showBuildingNamePanel(key) {
+      pendingBuildingNameKey = key;
+      const panel = document.getElementById('building-name-panel');
+      const input = document.getElementById('building-name-input');
+      input.value = buildingNames.get(key) || '';
+      panel.classList.remove('hidden');
+      input.focus();
+      input.select();
+  }
+
+  function closeBuildingNamePanel() {
+      pendingBuildingNameKey = null;
+      document.getElementById('building-name-panel').classList.add('hidden');
+  }
+
+  function commitBuildingName() {
+      if (!pendingBuildingNameKey) return;
+      const name = document.getElementById('building-name-input').value.trim().slice(0, 60);
+      if (!name) {
+          logPrompt('error', 'Enter a building name, or cancel to leave it unchanged.');
+          return;
+      }
+      buildingNames.set(pendingBuildingNameKey, name);
+      const saved = saveBuildingNames();
+      closeBuildingNamePanel();
+      updateNamedBuildingLabels();
+      logPrompt(saved ? 'bot' : 'error', saved ? `Building named "${name}".` : `Building named "${name}" for this session only.`);
+  }
+
+  function removeBuildingName(entry) {
+      const key = buildingNameKey(entry);
+      if (!buildingNames.has(key)) {
+          logPrompt('info', 'That building does not have a custom name.');
+          return;
+      }
+      const oldName = buildingNames.get(key);
+      buildingNames.delete(key);
+      const saved = saveBuildingNames();
+      updateNamedBuildingLabels();
+      logPrompt(saved ? 'bot' : 'error', saved
+          ? `Removed the name "${oldName}".`
+          : `Removed the name "${oldName}" for this session only.`);
   }
 
   function updateBuildingLabelsToggle() {
@@ -2318,6 +2655,41 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
           map.getCanvas().style.cursor = '';
       }
       updateBuildingDeleteButton();
+  }
+
+  function updateBuildingNameButtons() {
+      const nameButton = document.getElementById('building-name-btn');
+      const removeButton = document.getElementById('building-name-remove-btn');
+      if (!nameButton || !removeButton) return;
+      nameButton.classList.toggle('active', buildingNameMode === 'name');
+      removeButton.classList.toggle('active', buildingNameMode === 'remove');
+      nameButton.textContent = buildingNameMode === 'name' ? '🏷️ Click a building…' : '🏷️ Name building';
+      removeButton.textContent = buildingNameMode === 'remove' ? '✖️ Click to remove…' : '✖️ Remove building name';
+  }
+
+  function setBuildingNameMode(mode) {
+      if (buildingNameMode === mode) mode = null;
+      if (mode) {
+          if (pendingBuilding) cancelPendingBuilding();
+          if (pendingZone) cancelPendingZone();
+          if (tilePickerActive) setTilePickerActive(false);
+          if (roadDrawActive) cancelRoad();
+          if (roadDeleteActive) setRoadDeleteActive(false);
+          if (buildingDrawActive) cancelBuilding();
+          if (buildingEditActive) stopBuildingEdit();
+          if (buildingDeleteActive) setBuildingDeleteActive(false);
+          if (zoneDrawActive) cancelZone();
+          if (zoneDeleteActive) setZoneDeleteActive(false);
+          if (roadClosureMode) setRoadClosureMode(roadClosureMode);
+      }
+      buildingNameMode = mode;
+      map.getCanvas().style.cursor = mode ? 'crosshair' : '';
+      updateBuildingNameButtons();
+      logPrompt('info', mode === 'name'
+          ? 'Name building ON — click a building to enter its name.'
+          : mode === 'remove'
+              ? 'Remove building name ON — click a named building.'
+              : 'Building name tool OFF.');
   }
 
   function startBuildingDrawing() {
@@ -3083,7 +3455,21 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
             setBuildingLabelsVisible(!state.buildingLabels);
             logPrompt('bot', `Building labels ${state.buildingLabels ? 'ON' : 'OFF'}.`);
     });
-    document.getElementById('tile-picker-btn').addEventListener('click', () => setTilePickerActive(!tilePickerActive));
+      document.getElementById('building-name-btn').addEventListener('click', () => setBuildingNameMode('name'));
+      document.getElementById('building-name-remove-btn').addEventListener('click', () => setBuildingNameMode('remove'));
+      document.getElementById('building-name-save').addEventListener('click', commitBuildingName);
+      document.getElementById('building-name-cancel').addEventListener('click', closeBuildingNamePanel);
+      document.getElementById('building-name-input').addEventListener('keydown', event => {
+          if (event.key === 'Enter') {
+              event.preventDefault();
+              commitBuildingName();
+          } else if (event.key === 'Escape') {
+              event.preventDefault();
+              closeBuildingNamePanel();
+          }
+      });
+      updateBuildingNameButtons();
+      document.getElementById('tile-picker-btn').addEventListener('click', () => setTilePickerActive(!tilePickerActive));
     document.getElementById('tools-drawer-toggle').addEventListener('click', () => {
             const drawer = document.getElementById('tools-drawer');
             const expanded = drawer.classList.toggle('collapsed') === false;
@@ -3136,6 +3522,11 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
       const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA');
       if (typing) return;
 
+      if (buildingNameMode && e.key === 'Escape') {
+          e.preventDefault();
+          setBuildingNameMode(null);
+          return;
+      }
       if (pendingZone) {
           if (e.key === 'Escape') { e.preventDefault(); cancelPendingZone(); }
           return;
@@ -3185,6 +3576,20 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
   map.on('click', (e) => {
       if (suppressNextMapClick) { suppressNextMapClick = false; return; }
 
+      if (pendingBuildingNameKey) return;
+      if (buildingNameMode) {
+          const entry = findBuildingAtPoint(e.point);
+          if (!entry) return logPrompt('info', 'No building at that spot.');
+          if (buildingNameMode === 'remove') {
+              removeBuildingName(entry);
+          } else {
+              buildingNameMode = null;
+              map.getCanvas().style.cursor = '';
+              updateBuildingNameButtons();
+              showBuildingNamePanel(buildingNameKey(entry));
+          }
+          return;
+      }
       if (zoneDrawActive) {
           if (pendingZone) return;
           if (!zoneDraftCenter) placeZoneCenter(e.lngLat.lng, e.lngLat.lat);
@@ -3300,6 +3705,10 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
           else { clearBuildingDeleteHover(); map.getCanvas().style.cursor = 'crosshair'; }
           return;
       }
+      if (buildingNameMode) {
+          map.getCanvas().style.cursor = findBuildingAtPoint(e.point) ? 'pointer' : 'crosshair';
+          return;
+      }
       if (roadDrawActive) { draftCursor = [e.lngLat.lng, e.lngLat.lat]; setDraftData(); return; }
       if (roadDeleteActive) {
           const road = findRoadAtPoint(e.point);
@@ -3337,11 +3746,13 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
   });
 
   const parkController = createParkController({ map, center: CENTER, dbg });
+  const flagpoleController = createFlagpoleController({ map, coordinates: CENTER, dbg });
 
   map.on('load', () => {
       dbg('Map loaded.');
       setLoadingProgress(35, 'Loading map layers…');
       const weatherReady = weather.update();
+      flagpoleController.add();
       map.setLight({ anchor: 'viewport', color: '#ffffff', intensity: 0.6, position: [1.15, 210, 30] });
 
       detectFontStack();
@@ -3378,6 +3789,7 @@ import { preloadRegionTiles } from './src/tile-preloader.js';
 
       const loadedCount = loadCustomBuildings();
       if (loadedCount) dbg(`Loaded ${loadedCount} custom building(s).`);
+      loadBuildingNames();
 
       const loadedZones = loadZones();
       if (loadedZones) {

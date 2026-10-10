@@ -79,6 +79,8 @@
     <button id="building-build-btn" type="button">🏗️ Build building</button>
     <button id="building-delete-btn" type="button">🗑️ Delete building</button>
     <button id="building-edit-btn" type="button">✏️ Edit buildings</button>
+    <button id="building-name-btn" type="button">🏷️ Name building</button>
+    <button id="building-name-remove-btn" type="button">✖️ Remove building name</button>
     <button id="road-draw-btn" type="button">🛣️ Draw road</button>
     <button id="road-delete-btn" type="button">🗑️ Delete road</button>
     <button id="road-close-btn" type="button">⛔ Close road</button>
@@ -137,6 +139,16 @@
   </div>
   <div class="zone-class-actions">
     <button id="zone-class-cancel" type="button">Cancel</button>
+  </div>
+</div>
+
+<div id="building-name-panel" class="hidden" role="dialog" aria-labelledby="building-name-panel-header">
+  <div id="building-name-panel-header">Name building</div>
+  <label for="building-name-input">Name</label>
+  <input id="building-name-input" type="text" maxlength="60" autocomplete="off" />
+  <div class="height-panel-actions">
+    <button id="building-name-cancel" type="button">Cancel</button>
+    <button id="building-name-save" type="button">Save name</button>
   </div>
 </div>
 
