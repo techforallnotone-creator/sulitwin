@@ -42,6 +42,7 @@ import { createFlagpoleController } from './src/flagpole.js';
 
   const state = { ...DEFAULTS };
   const buildingNames = new Map();
+  const buildingNameAnchors = new Map();
   const geminiAssistant = createGeminiAssistant();
 
   const statusEl = document.getElementById('status');
@@ -319,6 +320,7 @@ import { createFlagpoleController } from './src/flagpole.js';
   let pendingBuilding = null;
   let buildingNameMode = null;
   let pendingBuildingNameKey = null;
+  let pendingBuildingNameAnchor = null;
 
   const zones = new Map();
   let zoneIdCounter = 0;
@@ -1021,6 +1023,7 @@ import { createFlagpoleController } from './src/flagpole.js';
       if (buildingDeleteActive) setBuildingDeleteActive(false);
       if (zoneDrawActive) cancelZone();
       if (zoneDeleteActive) setZoneDeleteActive(false);
+      if (buildingNameMode) setBuildingNameMode(null);
 
       roadClosureMode = mode;
       map.getCanvas().style.cursor = 'crosshair';
@@ -2005,12 +2008,33 @@ import { createFlagpoleController } from './src/flagpole.js';
       const textSize = zoom <= 18
           ? 12 + (zoom - 15) * (5 / 3)
           : 17 + (zoom - 18) * (4 / 3);
-      for (const entry of currentVisibleBuildings) {
-          const name = buildingNames.get(entry.key);
+      for (const [key, name] of buildingNames) {
           if (!name) continue;
-          const base = Number(entry.base) || 0;
-          const height = Math.max(3, Number(entry.height) || 0);
-          const metersPerPixel = 156543.03392 * Math.cos(entry.xy[1] * Math.PI / 180) / (2 ** zoom);
+          let entry = currentVisibleBuildings.find(candidate => candidate.key === key);
+          const savedAnchor = buildingNameAnchors.get(key);
+          if (!entry && savedAnchor) {
+              let closest = null;
+              let closestDistance = Infinity;
+              for (const candidate of currentVisibleBuildings) {
+                  const distance = haversineMeters(
+                      savedAnchor.xy[0], savedAnchor.xy[1], candidate.xy[0], candidate.xy[1]
+                  );
+                  if (distance < closestDistance) {
+                      closest = candidate;
+                      closestDistance = distance;
+                  }
+              }
+              if (closestDistance <= 5) entry = closest;
+          }
+          if (!entry) continue;
+          const anchor = savedAnchor || {
+              xy: entry.xy,
+              height: entry.height,
+              base: entry.base
+          };
+          const base = Number(anchor.base) || 0;
+          const height = Math.max(3, Number(anchor.height) || 0);
+          const metersPerPixel = 156543.03392 * Math.cos(anchor.xy[1] * Math.PI / 180) / (2 ** zoom);
           const verticalOffset = metersPerPixel > 0
               ? (base + height + 0.5) * Math.sin(pitch) / metersPerPixel / textSize
               : 0;
@@ -2019,7 +2043,7 @@ import { createFlagpoleController } from './src/flagpole.js';
               properties: { name, offset: [0, -verticalOffset] },
               geometry: {
                   type: 'Point',
-                  coordinates: entry.xy
+                  coordinates: anchor.xy
               }
           });
       }
@@ -2062,7 +2086,11 @@ import { createFlagpoleController } from './src/flagpole.js';
 
   function saveBuildingNames() {
       try {
-          localStorage.setItem(BUILDING_NAMES_STORAGE_KEY, JSON.stringify([...buildingNames]));
+          const entries = [...buildingNames].map(([key, name]) => [
+              key,
+              { name, anchor: buildingNameAnchors.get(key) || null }
+          ]);
+          localStorage.setItem(BUILDING_NAMES_STORAGE_KEY, JSON.stringify(entries));
           return true;
       } catch (error) {
           logPrompt('error', `Could not save building names: ${error.message}`);
@@ -2077,20 +2105,39 @@ import { createFlagpoleController } from './src/flagpole.js';
           const entries = JSON.parse(stored);
           if (!Array.isArray(entries)) throw new Error('Saved building names have an invalid format.');
           buildingNames.clear();
+          buildingNameAnchors.clear();
           for (const pair of entries) {
               if (!Array.isArray(pair) || pair.length < 2) continue;
-              const [key, rawName] = pair;
-              if (typeof key !== 'string' || typeof rawName !== 'string') continue;
+              const [key, value] = pair;
+              if (typeof key !== 'string') continue;
+              const rawName = typeof value === 'string' ? value : value?.name;
+              if (typeof rawName !== 'string') continue;
               const name = rawName.trim().slice(0, 60);
               if (key && name) buildingNames.set(key, name);
+              const anchor = value && typeof value === 'object' ? value.anchor : null;
+              if (key && Array.isArray(anchor?.xy) && anchor.xy.length === 2 &&
+                  anchor.xy.every(Number.isFinite)) {
+                  buildingNameAnchors.set(key, {
+                      xy: anchor.xy,
+                      height: Number(anchor.height) || 0,
+                      base: Number(anchor.base) || 0
+                  });
+              }
           }
       } catch (error) {
           logPrompt('error', `Could not load building names: ${error.message}`);
       }
   }
 
-  function showBuildingNamePanel(key) {
+  function showBuildingNamePanel(key, entry) {
       pendingBuildingNameKey = key;
+      const visibleEntry = currentVisibleBuildings.find(candidate => candidate.key === key);
+      const xy = visibleEntry?.xy || geometryCenter(entry.geometry);
+      pendingBuildingNameAnchor = xy ? {
+          xy,
+          height: visibleEntry?.height ?? entry.height ?? 12,
+          base: visibleEntry?.base ?? entry.base ?? 0
+      } : null;
       const panel = document.getElementById('building-name-panel');
       const input = document.getElementById('building-name-input');
       input.value = buildingNames.get(key) || '';
@@ -2101,6 +2148,7 @@ import { createFlagpoleController } from './src/flagpole.js';
 
   function closeBuildingNamePanel() {
       pendingBuildingNameKey = null;
+      pendingBuildingNameAnchor = null;
       document.getElementById('building-name-panel').classList.add('hidden');
   }
 
@@ -2112,6 +2160,9 @@ import { createFlagpoleController } from './src/flagpole.js';
           return;
       }
       buildingNames.set(pendingBuildingNameKey, name);
+      if (pendingBuildingNameAnchor) {
+          buildingNameAnchors.set(pendingBuildingNameKey, pendingBuildingNameAnchor);
+      }
       const saved = saveBuildingNames();
       closeBuildingNamePanel();
       updateNamedBuildingLabels();
@@ -2126,6 +2177,7 @@ import { createFlagpoleController } from './src/flagpole.js';
       }
       const oldName = buildingNames.get(key);
       buildingNames.delete(key);
+      buildingNameAnchors.delete(key);
       const saved = saveBuildingNames();
       updateNamedBuildingLabels();
       logPrompt(saved ? 'bot' : 'error', saved
@@ -2250,6 +2302,7 @@ import { createFlagpoleController } from './src/flagpole.js';
           if (buildingDeleteActive) setBuildingDeleteActive(false);
           if (zoneDrawActive) cancelZone();
           if (zoneDeleteActive) setZoneDeleteActive(false);
+          if (buildingNameMode) setBuildingNameMode(null);
       }
       tilePickerActive = active;
       const btn = document.getElementById('tile-picker-btn');
@@ -2379,9 +2432,11 @@ import { createFlagpoleController } from './src/flagpole.js';
   }
 
   function startRoadDrawing() {
+      if (buildingNameMode) setBuildingNameMode(null);
       roadLifecycle.startRoadDrawing();
   }
   function startRoadDeleting() {
+      if (buildingNameMode) setBuildingNameMode(null);
       roadLifecycle.startRoadDeleting();
   }
 
@@ -2542,6 +2597,30 @@ import { createFlagpoleController } from './src/flagpole.js';
       const assumptions = document.createElement('div');
       assumptions.className = 'map-ai-assumptions';
       assumptions.textContent = 'Concrete + standard materials; $700/m² and 450 kg CO₂e/m² of gross floor area, 0.5 peak-hour trips per 100 m², and ~12 months per 2,500 m² (minimum 2 months). Planning estimate only.';
+      const legalSection = document.createElement('section');
+      legalSection.className = 'building-legal-check';
+      const legalHeading = document.createElement('strong');
+      legalHeading.textContent = 'Legal & permitting check';
+      const legalLocation = document.createElement('div');
+      legalLocation.className = 'building-legal-location';
+      legalLocation.textContent = `Site coordinates (lat, lon): ${center[1].toFixed(6)}, ${center[0].toFixed(6)} · legal status not verified`;
+      const legalNotice = document.createElement('p');
+      legalNotice.textContent = 'This map has no authoritative parcel, ownership, zoning, permit, easement, protected-site, or current building-code records, so it cannot determine whether construction here is allowed. User-created Flood/Green/Shade overlays are planning scenarios, not official legal designations.';
+      const legalChecks = document.createElement('ul');
+      for (const check of [
+          'Confirm ownership, parcel boundaries, and easements with the relevant land registry.',
+          'Ask municipal planning to confirm permitted use, density, height limits, and setbacks for this parcel.',
+          'Confirm required planning/building permits and approved structural plans before construction.',
+          'Check access, fire safety, utilities, and any environmental, heritage, or flood constraints with the relevant authorities.'
+      ]) {
+          const item = document.createElement('li');
+          item.textContent = check;
+          legalChecks.append(item);
+      }
+      const legalDisclaimer = document.createElement('p');
+      legalDisclaimer.className = 'building-legal-disclaimer';
+      legalDisclaimer.textContent = 'Informational checklist only, not legal advice or an official site determination.';
+      legalSection.append(legalHeading, legalLocation, legalNotice, legalChecks, legalDisclaimer);
       const note = document.createElement('div');
       note.className = 'map-ai-note';
       note.textContent = geminiAssistant.hasApiKey() ? 'Gemini is preparing an estimate note…' : 'Set an AI key for a Gemini explanation.';
@@ -2554,7 +2633,7 @@ import { createFlagpoleController } from './src/flagpole.js';
           buildingInsightMarkers.get(building.id)?.remove();
           buildingInsightMarkers.delete(building.id);
       });
-      container.append(heading, details, assumptions, note, close);
+      container.append(heading, details, assumptions, legalSection, note, close);
       buildingInsightMarkers.get(building.id)?.remove();
       const marker = new maplibregl.Marker({
           element: container,
@@ -2613,6 +2692,7 @@ import { createFlagpoleController } from './src/flagpole.js';
 
   function setBuildingDrawActive(active) {
       if (active) {
+          if (buildingNameMode) setBuildingNameMode(null);
           if (tilePickerActive) setTilePickerActive(false);
           if (roadDrawActive) cancelRoad();
           if (roadDeleteActive) setRoadDeleteActive(false);
@@ -2637,6 +2717,7 @@ import { createFlagpoleController } from './src/flagpole.js';
 
   function setBuildingDeleteActive(active) {
       if (active) {
+          if (buildingNameMode) setBuildingNameMode(null);
           if (tilePickerActive) setTilePickerActive(false);
           if (roadDrawActive) cancelRoad();
           if (roadDeleteActive) setRoadDeleteActive(false);
@@ -2663,6 +2744,8 @@ import { createFlagpoleController } from './src/flagpole.js';
       if (!nameButton || !removeButton) return;
       nameButton.classList.toggle('active', buildingNameMode === 'name');
       removeButton.classList.toggle('active', buildingNameMode === 'remove');
+      nameButton.setAttribute('aria-pressed', String(buildingNameMode === 'name'));
+      removeButton.setAttribute('aria-pressed', String(buildingNameMode === 'remove'));
       nameButton.textContent = buildingNameMode === 'name' ? '🏷️ Click a building…' : '🏷️ Name building';
       removeButton.textContent = buildingNameMode === 'remove' ? '✖️ Click to remove…' : '✖️ Remove building name';
   }
@@ -2837,10 +2920,12 @@ import { createFlagpoleController } from './src/flagpole.js';
   }
 
   function startZoneDrawing() {
+      if (buildingNameMode) setBuildingNameMode(null);
       zoneController.startZoneDrawing();
       logPrompt('bot', 'Zone drawing ON — click to place center, then radius.');
   }
   function startZoneDeleting() {
+      if (buildingNameMode) setBuildingNameMode(null);
       zoneController.startZoneDeleting();
       logPrompt('bot', 'Zone deletion ON.');
   }
@@ -3586,7 +3671,7 @@ import { createFlagpoleController } from './src/flagpole.js';
               buildingNameMode = null;
               map.getCanvas().style.cursor = '';
               updateBuildingNameButtons();
-              showBuildingNamePanel(buildingNameKey(entry));
+              showBuildingNamePanel(buildingNameKey(entry), entry);
           }
           return;
       }
